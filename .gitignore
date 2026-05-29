@@ -1,0 +1,4 @@
+.venv/
+.antigravitycli
+__pycache__/
+models/*
