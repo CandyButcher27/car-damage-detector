@@ -268,7 +268,9 @@ def _normalize_for_translation(text: str) -> str:
     return text
 
 
-def _is_arabic_char(ch: str) -> bool:
+def _is_arabic_char(ch: object) -> bool:
+    if not isinstance(ch, str) or len(ch) != 1:
+        return False
     # Covers Arabic + Arabic Supplement + Arabic Extended-A + presentation forms.
     code = ord(ch)
     return (
@@ -432,7 +434,7 @@ def _fix_reversed_arabic_runs(text: str) -> str:
 
 
 def _postprocess_ocr_line(
-    text: str,
+    text: object,
     lang: str,
     fix_arabic_reverse: bool,
     reshape_arabic: bool,
@@ -453,7 +455,15 @@ def _postprocess_ocr_line(
     Both steps are no-ops for non-Arabic languages.
     """
     if not text:
-        return text
+        return ""
+    if not isinstance(text, str):
+        if isinstance(text, (list, tuple)):
+            try:
+                text = " ".join(str(item) for item in text)
+            except Exception:
+                text = str(text)
+        else:
+            text = str(text)
     is_ar = lang.lower() in {"ar", "arabic"}
     if fix_arabic_reverse and is_ar:
         text = _fix_reversed_arabic_runs(text)

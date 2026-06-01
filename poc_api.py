@@ -241,6 +241,17 @@ def _classify_file_with_llm(
 
 app = FastAPI(title="UpSure PoC Document and Car Pipeline")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 _card_model: CardNonCardModel | None = None
 _car_model: Any | None = None
 _car_img_size = CAR_FALLBACK_SIZE
