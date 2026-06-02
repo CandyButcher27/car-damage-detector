@@ -21,6 +21,11 @@ DEFAULT_SAMPLE_FILES = {
     "card": ROOT_DIR / "Samples" / "Mulkiya_front.jpg",
     "document": ROOT_DIR / "Samples" / "sample_pdf.pdf",
     "noncar": ROOT_DIR / "Samples" / "Non_card_image_1.jpeg",
+    # damage views default to same car sample — override with --front-file etc.
+    "front": ROOT_DIR / "Samples" / "car_10.jpg",
+    "back": ROOT_DIR / "Samples" / "car_10.jpg",
+    "left": ROOT_DIR / "Samples" / "car_10.jpg",
+    "right": ROOT_DIR / "Samples" / "car_10.jpg",
 }
 
 
@@ -82,6 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[
             "health",
             "predict-car",
+            "predict-damage",
             "process-car",
             "process-mulkiya",
             "process-pdf",
@@ -135,6 +141,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-json", default=None, help="Optional path to write the raw benchmark results as JSON.")
     parser.add_argument("--skip-standalone", action="store_true", help="Skip benchmarking the standalone car API.")
+    parser.add_argument("--front-file", type=Path, default=DEFAULT_SAMPLE_FILES["front"],
+                        help="Front view image for /predict/damage benchmark.")
+    parser.add_argument("--back-file",  type=Path, default=DEFAULT_SAMPLE_FILES["back"],
+                        help="Back view image for /predict/damage benchmark.")
+    parser.add_argument("--left-file",  type=Path, default=DEFAULT_SAMPLE_FILES["left"],
+                        help="Left view image for /predict/damage benchmark.")
+    parser.add_argument("--right-file", type=Path, default=DEFAULT_SAMPLE_FILES["right"],
+                        help="Right view image for /predict/damage benchmark.")
     return parser
 
 
@@ -241,6 +255,60 @@ def _build_multipart_body(file_path: Path, extra_data: dict[str, Any] | None) ->
     )
 
     return b"".join(chunks), boundary
+
+
+def _build_multipart_damage_body(view_files: dict[str, Path]) -> tuple[bytes, str]:
+    """Build multipart body with named view fields (front/back/left/right)."""
+    boundary = f"----upsure-damage-{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    for field_name, file_path in view_files.items():
+        file_bytes = file_path.read_bytes()
+        chunks.extend([
+            f"--{boundary}\r\n".encode("utf-8"),
+            (
+                f'Content-Disposition: form-data; name="{field_name}"; filename="{file_path.name}"\r\n'
+                f"Content-Type: {_guess_mime_type(file_path)}\r\n\r\n"
+            ).encode("utf-8"),
+            file_bytes,
+            b"\r\n",
+        ])
+
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), boundary
+
+
+def _send_damage_post(url: str, timeout: float, name: str, view_files: dict[str, Path]) -> LatencySample:
+    started_at = time.perf_counter()
+    try:
+        body, boundary = _build_multipart_damage_body(view_files)
+        request = Request(
+            url,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        response = _send_request(request, timeout)
+        return LatencySample(
+            name=name,
+            method="POST",
+            url=url,
+            status_code=response.status_code,
+            elapsed_ms=_request_elapsed_ms(started_at),
+            server_ms=_parse_server_ms(response),
+            ok=response.ok,
+        )
+    except (OSError, URLError, ValueError) as exc:
+        return LatencySample(
+            name=name,
+            method="POST",
+            url=url,
+            status_code=None,
+            elapsed_ms=_request_elapsed_ms(started_at),
+            server_ms=None,
+            ok=False,
+            error=str(exc),
+        )
 
 
 def _send_multipart_post(
@@ -377,7 +445,7 @@ def _print_summary(summary: dict[str, Any]) -> None:
 def _selected_scenarios(args: argparse.Namespace) -> set[str]:
     requested = set(args.scenario or ["all"])
     if "all" in requested:
-        requested.update({"health", "predict-car", "process-car", "process-mulkiya", "process-pdf"})
+        requested.update({"health", "predict-car", "predict-damage", "process-car", "process-mulkiya", "process-pdf"})
         if not args.skip_standalone:
             requested.add("standalone-car")
     if args.skip_standalone:
@@ -394,6 +462,12 @@ def main() -> int:
         "car": _ensure_file(args.car_file),
         "mulkiya": _ensure_file(args.mulkiya_file),
         "pdf": _ensure_file(args.pdf_file),
+    }
+    damage_view_files = {
+        "front": _ensure_file(args.front_file),
+        "back":  _ensure_file(args.back_file),
+        "left":  _ensure_file(args.left_file),
+        "right": _ensure_file(args.right_file),
     }
     results: list[dict[str, Any]] = []
 
@@ -433,6 +507,16 @@ def main() -> int:
                 args.timeout,
                 "Unified POST /predict/ (car)",
                 sample_files["car"],
+            ),
+        ),
+        Scenario(
+            "predict-damage",
+            "Unified POST /predict/damage (4 views)",
+            lambda: _send_damage_post(
+                f"{unified_base}/predict/damage",
+                args.timeout,
+                "Unified POST /predict/damage (4 views)",
+                damage_view_files,
             ),
         ),
         Scenario(
