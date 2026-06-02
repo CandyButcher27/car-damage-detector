@@ -15,8 +15,10 @@ from typing import Any, Literal
 from xml.etree import ElementTree
 
 import numpy as np
+import onnxruntime as ort
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, ImageOps
 
@@ -54,7 +56,12 @@ if load_keras_model is not None:
 POC_DIR = Path(__file__).resolve().parent
 OCR_SCRIPT = POC_DIR / "ocr_simple_test.py"
 MODEL_PATH = _resolve_model_path(POC_DIR, None)
-CAR_MODEL_PATH = POC_DIR / "models" / "best_car_model.keras"
+CAR_MODEL_PATH    = POC_DIR / "models" / "best_car_model.keras"
+DAMAGE_MODEL_PATH = POC_DIR / "models" / "damage_model.onnx"
+DAMAGE_THRESHOLD  = 0.25
+DAMAGE_IMG_SIZE   = 260
+DAMAGE_MEAN       = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+DAMAGE_STD        = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 OCR_PYTHON_DEFAULT = Path("D:/UpSure/OCR_test/venv/Scripts/python.exe")
 if not OCR_PYTHON_DEFAULT.exists():
     OCR_PYTHON_DEFAULT = POC_DIR.parent / "OCR_test" / "venv" / "Scripts" / "python.exe"
@@ -70,8 +77,6 @@ CAR_FALLBACK_SIZE = 128
 PROCESS_TYPES = ("car", "mulkiya", "pdf", "file")
 
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app = FastAPI(title="UpSure PoC Document and Car Pipeline")
 
 app.add_middleware(
@@ -84,6 +89,7 @@ app.add_middleware(
 _card_model: CardNonCardModel | None = None
 _car_model: Any | None = None
 _car_img_size = CAR_FALLBACK_SIZE
+_damage_session: ort.InferenceSession | None = None
 
 
 @app.middleware("http")
@@ -125,6 +131,39 @@ def _get_car_model() -> Any:
         _car_model = load_keras_model(str(CAR_MODEL_PATH))
         _car_img_size = _get_car_img_size(_car_model)
     return _car_model
+
+
+def _get_damage_session() -> ort.InferenceSession:
+    global _damage_session
+    if _damage_session is None:
+        if not DAMAGE_MODEL_PATH.exists():
+            raise FileNotFoundError(f"Damage model not found at {DAMAGE_MODEL_PATH}")
+        _damage_session = ort.InferenceSession(
+            str(DAMAGE_MODEL_PATH), providers=["CPUExecutionProvider"]
+        )
+    return _damage_session
+
+
+def _preprocess_for_damage(img_bytes: bytes) -> np.ndarray:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img = img.resize((DAMAGE_IMG_SIZE, DAMAGE_IMG_SIZE), Image.LANCZOS)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = (arr - DAMAGE_MEAN) / DAMAGE_STD
+    return arr.transpose(2, 0, 1)[np.newaxis]
+
+
+def _run_damage_inference(arr: np.ndarray) -> dict[str, Any]:
+    sess = _get_damage_session()
+    input_name = sess.get_inputs()[0].name
+    logits = sess.run(None, {input_name: arr})[0][0]
+    probs = np.exp(logits) / np.exp(logits).sum()
+    label = 1 if probs[1] >= DAMAGE_THRESHOLD else 0
+    return {
+        "damage_detected":  bool(label == 1),
+        "confidence_score": float(round(float(probs[label]), 4)),
+        "prob_damaged":     float(round(float(probs[1]), 4)),
+        "prob_clean":       float(round(float(probs[0]), 4)),
+    }
 
 
 def _classify_car_image(image_path: Path) -> dict[str, Any]:
@@ -724,6 +763,55 @@ async def process_document(
             )
 
     raise HTTPException(status_code=500, detail="Unhandled process_type.")
+
+
+@app.post("/predict/damage")
+async def predict_damage(
+    front: UploadFile | None = File(default=None),
+    back:  UploadFile | None = File(default=None),
+    left:  UploadFile | None = File(default=None),
+    right: UploadFile | None = File(default=None),
+) -> dict[str, Any]:
+    """
+    Car damage detection endpoint.
+    Accepts 1–4 vehicle view images (front/back/left/right).
+    All views that are confirmed cars are run through the damage model.
+    damage_detected=true if ANY view is damaged.
+
+    Call this AFTER /api/v1/process?process_type=car confirms is_car=true for each view.
+    """
+    views: dict[str, UploadFile] = {
+        k: v for k, v in [("front", front), ("back", back), ("left", left), ("right", right)] if v
+    }
+
+    if not views:
+        raise HTTPException(status_code=400, detail="Provide at least one image (front/back/left/right).")
+
+    try:
+        _get_damage_session()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    per_view: dict[str, Any] = {}
+    overall_damaged = False
+    max_confidence = 0.0
+
+    for view_name, upload in views.items():
+        img_bytes = await upload.read()
+        arr = _preprocess_for_damage(img_bytes)
+        pred = _run_damage_inference(arr)
+        per_view[view_name] = pred
+        if pred["damage_detected"]:
+            overall_damaged = True
+        if pred["confidence_score"] > max_confidence:
+            max_confidence = pred["confidence_score"]
+
+    return {
+        "damage_detected":      overall_damaged,
+        "total_views_analyzed": len(views),
+        "overall_confidence":   round(max_confidence, 4),
+        "per_view":             per_view,
+    }
 
 
 def _load_image(path: Path):
