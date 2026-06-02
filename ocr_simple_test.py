@@ -3,15 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 import time
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 
 if sys.platform.startswith("win"):
@@ -290,7 +287,7 @@ def _reshape_arabic(text: str, enabled: bool = True) -> str:
     arabic_reshaper reconnects isolated glyphs that OCR engines often emit as
     disconnected presentation forms (e.g. ي ر ا ك -> كاري).  Reshaping is applied
     once, right after OCR detection, so every downstream consumer (rule extractor,
-    LLM prompt, text files, translation) receives consistently joined Arabic text.
+    text files and translation output receives consistently joined Arabic text.
     """
     if not enabled or not text or not _contains_arabic(text):
         return text
@@ -320,7 +317,7 @@ def _convert_arabic_indic_digits_to_ascii(s: str) -> str:
 def _apply_ocr_postprocessing(lines: list, enable_reshape: bool = True) -> list:
     """Post-process all OCR lines: reshape Arabic, normalize, clean whitespace.
 
-    This ensures every downstream step (extraction, LLM, translation, text files)
+    This ensures every downstream step (extraction, translation, text files)
     work with consistently formatted Arabic text.
     """
     out = []
@@ -389,7 +386,7 @@ def _group_ocr_lines_by_field(lines: list[str]) -> dict[str, list[str]]:
     """Group OCR lines by detected field labels (Arabic labels often appear inline).
 
     Note: Disabled for now due to Arabic presentation-form mismatches after reshaping.
-    Returns all lines in '_other' for direct use in LLM prompts.
+    Returns all lines in '_other' for direct use by downstream extractors.
     """
     # TODO: Fix label matching to work with presentation forms from arabic-reshaper
     return {"_other": lines}
@@ -441,13 +438,13 @@ def _postprocess_ocr_line(
 
     Running this once at the source means the clean text propagates to all
     downstream consumers automatically: annotated image labels, text-file writers,
-    rule-based Mulkiya extractor, and the LLM prompt.
+    and rule-based Mulkiya extractor.
 
     Pipeline (in order):
       1. Reverse-run fix  -- corrects glyphs emitted in wrong logical order by some
                              OCR models (e.g. "ةنطلس" -> "سلطنة").
       2. Arabic reshaper  -- reconnects isolated presentation-form glyphs into proper
-                             joined Unicode forms so that LLMs and NLP tools can read
+                             joined Unicode forms so that NLP tools can read
                              the words correctly (e.g. ي ر ا ك -> كاري).
 
     Both steps are no-ops for non-Arabic languages.
@@ -509,236 +506,6 @@ def _sort_lines(lines: list, rtl: bool) -> list:
         sorted_items.extend([it for (it, *_rest) in row_items])
 
     return sorted_items
-
-
-def _ollama_extract_mulkya(
-    lines: list[str],
-    host: str,
-    model: str,
-    timeout_s: float,
-    api_key: str | None = None,
-) -> dict:
-    """Call Ollama model to extract Mulkiya fields from OCR lines.
-
-    Lines must already be post-processed (reshaped) by _postprocess_ocr_line
-    before reaching here. This function groups lines by field labels to reduce
-    noise and improve LLM accuracy.
-    
-    Args:
-        lines: Processed OCR text lines
-        host: Ollama host URL (local or cloud)
-        model: Model name (e.g., "qwen2.5:7b-instruct" or "qwen2.5:235b")
-        timeout_s: Request timeout in seconds
-        api_key: Optional API key for Ollama Cloud authentication
-    """
-    # Group lines by field labels to organize scattered OCR chunks.
-    grouped = _group_ocr_lines_by_field(lines)
-    grouped_text = "\n".join(
-        f"{field}: " + " | ".join(grouped.get(field, []))
-        for field in sorted(grouped.keys())
-        if grouped.get(field)
-    )
-
-    prompt = (
-    "You are an OCR document extraction engine.\n"
-    "Your task is to extract structured fields from OCR text of an Oman vehicle registration card (Mulkiya).\n\n"
-
-    "IMPORTANT:\n"
-    "- OCR text is noisy, fragmented, multilingual, and may contain spelling mistakes.\n"
-    "- Arabic words may be split across lines.\n"
-    "- Labels and values may appear BEFORE or AFTER each other.\n"
-    "- Multiple consecutive OCR lines may belong to ONE field.\n"
-    "- Infer field associations using nearby lines and document structure.\n"
-    "- Ignore unrelated government/header text.\n"
-    "- NEVER hallucinate values.\n"
-    "- If uncertain, use null.\n\n"
-
-    "Return ONLY valid JSON.\n"
-    "No markdown.\n"
-    "No explanation.\n\n"
-
-    "JSON schema:\n"
-    "{\n"
-    '  "document_type": "oman_mulkiya_front",\n'
-    '  "plate_number": string|null,\n'
-    '  "vehicle_type": string|null,\n'
-    '  "make": string|null,\n'
-    '  "model": string|null,\n'
-    '  "color": string|null,\n'
-    '  "year": integer|null,\n'
-    '  "country_of_origin": string|null,\n'
-    '  "vin_or_chassis": string|null,\n'
-    '  "engine_number": string|null,\n'
-    '  "engine_cc": integer|null,\n'
-    '  "empty_weight_kg": integer|null,\n'
-    '  "max_load_kg": integer|null,\n'
-    '  "seats": integer|null,\n'
-    '  "issue_date": string|null,\n'
-    '  "expiry_date": string|null\n'
-    "}\n\n"
-
-    "Field extraction rules:\n"
-
-    "1. Plate number:\n"
-    "- Arabic labels may include:\n"
-    "  رقم اللوحة\n"
-    "  اللوحة\n"
-    "- Usually numeric.\n"
-    "- Example: 80772\n\n"
-
-    "2. Vehicle type:\n"
-    "- Arabic labels may include:\n"
-    "  نوع المركبة\n"
-    "- Examples:\n"
-    "  خصوصي = Private\n"
-    "  صالون = Sedan\n\n"
-
-    "3. Make:\n"
-    "- Examples:\n"
-    "  تويوتا = Toyota\n"
-    "  نيسان = Nissan\n"
-    "  هوندا = Honda\n\n"
-
-    "4. Model:\n"
-    "- Examples:\n"
-    "  كورولا = Corolla\n"
-    "  كامري = Camry\n\n"
-
-    "5. Year:\n"
-    "- Arabic labels:\n"
-    "  سنة الصنع\n"
-    "  سنة\n"
-    "- Convert 2-digit years to 4-digit when obvious.\n"
-    "- Example:\n"
-    "  013 -> 2013\n"
-    "  03 -> 2003\n\n"
-
-    "6. Country of origin:\n"
-    "- Arabic labels:\n"
-    "  المنشأ\n"
-    "- Examples:\n"
-    "  اليابان = Japan\n"
-    "  تايوان = Taiwan\n"
-    "  الصين = China\n\n"
-
-    "7. Engine CC:\n"
-    "- Arabic labels may include:\n"
-    "  سعة المحرك\n"
-    "- Numeric only.\n"
-    "- Common range: 600-8000.\n"
-    "- Example: 1794\n\n"
-
-    "8. Empty weight:\n"
-    "- Arabic labels:\n"
-    "  الوزن فارغ\n"
-    "- Units may appear separately:\n"
-    "  كجم\n"
-    "- Example: 1255\n\n"
-
-    "9. Max load:\n"
-    "- Arabic labels:\n"
-    "  الحمولة القصوى\n"
-    "- Example: 370\n\n"
-
-    "10. Seats:\n"
-    "- Arabic labels:\n"
-    "  عدد الركاب\n"
-    "- DO NOT confuse with:\n"
-    "  عدد المحاور\n"
-    "- Usually small integer.\n\n"
-
-    "11. VIN / Chassis:\n"
-    "- Arabic labels:\n"
-    "  رقم الشاصي\n"
-    "  رقم القاعدة\n"
-    "- Usually long alphanumeric string.\n"
-    "- Example:\n"
-    "  RKLBC42E7D531601\n\n"
-
-    "12. Engine number:\n"
-    "- Arabic labels:\n"
-    "  رقم المحرك\n"
-    "- Example:\n"
-    "  X274452\n\n"
-
-    "13. Dates:\n"
-    "- Arabic labels may include:\n"
-    "  صلاحية الرخصة\n"
-    "  من\n"
-    "  ل\n"
-    "- Preserve original format.\n"
-    "- Example:\n"
-    "  2025/06/03\n\n"
-
-    "OCR handling rules:\n"
-    "- OCR may contain misspellings:\n"
-    "  TIRAFIIC -> TRAFFIC\n"
-    "  L1CENSE -> LICENSE\n"
-    "- Arabic characters may be imperfect.\n"
-    "- Ignore confidence values.\n"
-    "- Ignore headers like:\n"
-    "  SULTANATE OF OMAN\n"
-    "  ROYAL OMAN POLICE\n"
-    "- Merge neighboring OCR lines when they clearly belong together.\n"
-    "- Prefer values closest to matching labels.\n"
-    "- Numeric values without nearby labels should NOT be guessed.\n\n"
-
-    "Expected extraction from this type of OCR:\n"
-    "- 80772 -> plate_number\n"
-    "- خصوصي -> vehicle_type\n"
-    "- تويوتا -> make\n"
-    "- كورولا -> model\n"
-    "- 013 -> year=2013\n"
-    "- 1794 -> engine_cc\n"
-    "- 1255 -> empty_weight_kg\n"
-    "- 370 -> max_load_kg\n"
-    "- RKLBC42E7D531601 -> vin_or_chassis\n"
-    "- X274452 -> engine_number\n"
-    "- 2025/06/03 and 2026/05/30 -> dates\n\n"
-
-    "Grouped OCR lines (organized by detected field labels):\n"
-    + grouped_text
-    + "\n\n"
-    + "(Raw OCR lines for reference):\n"
-    + "\n".join(f"{i+1:02d}. {ln}" for i, ln in enumerate(lines) if ln.strip())
-)
-
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "You output strict JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": 0},
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-    url = host.rstrip("/") + "/api/chat"
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    req = Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-    except URLError as exc:
-        raise SystemExit(
-            "Failed to call Ollama. Ensure Ollama is running and reachable at "
-            f"{host} (default http://localhost:11434). For Ollama Cloud, provide --ollama_api_key."
-        ) from exc
-
-    payload = json.loads(raw)
-    content = (payload.get("message") or {}).get("content")
-    if not content:
-        raise SystemExit("Ollama returned no content.")
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise SystemExit("Ollama did not return valid JSON.") from exc
 
 
 def _extract_mulkya_rulebased(lines: list[str]) -> dict:
@@ -942,7 +709,7 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
         "issue_date": issue_date,
         "expiry_date": expiry_date,
         "owner_name": None,
-        "notes": "Heuristic extraction; use --llm_backend ollama for better structuring.",
+        "notes": "Heuristic extraction.",
     }
 
 
@@ -1096,36 +863,6 @@ def parse_args() -> argparse.Namespace:
         help="Image only: extract structured Mulkiya vehicle details into <image>_mulkya.json",
     )
     parser.add_argument(
-        "--llm_backend",
-        default="none",
-        choices=["none", "ollama"],
-        help="Optional local LLM backend for structuring data (default: none)",
-    )
-    parser.add_argument(
-        "--ollama_host",
-        default="http://127.0.0.1:11434",
-        help=(
-            "Ollama host URL (default: http://127.0.0.1:11434 for local). "
-            "For Ollama Cloud, use your cloud endpoint (e.g., https://api.ollama.cloud/..."
-        ),
-    )
-    parser.add_argument(
-        "--ollama_model",
-        default="qwen2.5:7b-instruct",
-        help="Ollama model name (default: qwen2.5:7b-instruct). For 235B use: qwen2.5:235b",
-    )
-    parser.add_argument(
-        "--ollama_api_key",
-        default=os.getenv("OLLAMA_API_KEY"),
-        help="API key for Ollama Cloud authentication (required for cloud endpoints). Defaults to OLLAMA_API_KEY env var.",
-    )
-    parser.add_argument(
-        "--llm_timeout",
-        type=float,
-        default=120.0,
-        help="LLM request timeout seconds (default: 120)",
-    )
-    parser.add_argument(
         "--write_benchmark",
         action="store_true",
         help="Write benchmark CSV (timings/conf stats) into output folder",
@@ -1251,7 +988,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # postprocess() — call this on every raw OCR text string right after
     # PaddleOCR returns it.  Running once here means all downstream
-    # consumers (file writers, rule extractor, LLM prompt) share the same
+    # consumers (file writers and rule extractor) share the same
     # clean, properly shaped Arabic text without any extra conversion steps.
     # ------------------------------------------------------------------
     def postprocess(text: str) -> str:
@@ -1407,7 +1144,7 @@ def main() -> None:
 
                         # ── POST-PROCESS every OCR line right after detection ──
                         # arabic-reshaper runs here — once — so the reshaped text
-                        # flows into file writers, rule extractor, and LLM prompt.
+                        # flows into file writers and rule extractor.
                         lines = [
                             (box, (postprocess(text), conf))
                             for box, (text, conf) in raw_lines
@@ -1551,7 +1288,7 @@ def main() -> None:
 
     # ── POST-PROCESS every OCR line right after detection ───────────────────
     # arabic-reshaper runs here — once — so the same reshaped text is used in
-    # the annotated-image labels, text files, rule extractor, and LLM prompt.
+    # the annotated-image labels, text files, and rule extractor.
     lines = [
         (box, (postprocess(text), conf))
         for box, (text, conf) in raw_lines
@@ -1617,97 +1354,6 @@ def main() -> None:
                     ordered.append(nt)
 
         data = _extract_mulkya_rulebased(ordered)
-
-        if args.llm_backend == "ollama":
-            try:
-                # ordered lines are already reshaped upstream — pass them directly.
-                llm_data = _ollama_extract_mulkya(
-                    ordered,
-                    host=args.ollama_host,
-                    model=args.ollama_model,
-                    timeout_s=args.llm_timeout,
-                    api_key=args.ollama_api_key,
-                )
-                if isinstance(llm_data, dict):
-                    merged = dict(data)
-
-                    context_text = "\n".join(ordered)
-                    has_seats_number = bool(
-                        re.search(r"الركاب\s*[::]?\s*\d+", context_text)
-                        or re.search(r"\b\d+\b\s*[::]?\s*الركاب", context_text)
-                    )
-
-                    merged["plate_number"] = merged.get("plate_number") or llm_data.get("plate_number")
-                    merged["vin_or_chassis"] = merged.get("vin_or_chassis") or llm_data.get("vin_or_chassis")
-
-                    for k, min_v, max_v in [
-                        ("engine_cc", 200, 10000),
-                        ("empty_weight_kg", 200, 10000),
-                        ("max_load_kg", 0, 50000),
-                        ("seats", 1, 80),
-                    ]:
-                        if merged.get(k) is None:
-                            if k == "seats" and not has_seats_number:
-                                merged[k] = None
-                            else:
-                                merged[k] = _coerce_int(llm_data.get(k), min_v=min_v, max_v=max_v)
-
-                    if merged.get("year") is None:
-                        merged["year"] = _coerce_year(llm_data.get("year"))
-
-                    for dk in ["issue_date", "expiry_date"]:
-                        if merged.get(dk) is None:
-                            dv = llm_data.get(dk)
-                            if isinstance(dv, str) and re.search(r"\b\d{2,4}/\d{1,2}/\d{1,2}\b", dv):
-                                merged[dk] = dv
-
-                    def is_ascii(s: str) -> bool:
-                        try:
-                            s.encode("ascii")
-                            return True
-                        except Exception:
-                            return False
-
-                    for tk in ["make", "model"]:
-                        tv = llm_data.get(tk)
-                        if isinstance(tv, str):
-                            tv = tv.strip()
-                        if tv and (merged.get(tk) is None or is_ascii(tv)):
-                            merged[tk] = tv
-
-                    for tk in ["vehicle_type", "color"]:
-                        tv = llm_data.get(tk)
-                        if isinstance(tv, str):
-                            tv = tv.strip()
-                        if not tv:
-                            continue
-                        if merged.get(tk) is None:
-                            merged[tk] = tv
-                            continue
-                        if is_ascii(tv):
-                            merged[tk] = tv
-
-                    if merged.get("owner_name") is None:
-                        ov = llm_data.get("owner_name")
-                        if isinstance(ov, str):
-                            ov = ov.strip()
-                        if ov and not any(bad in ov for bad in ["رخصة", "مركبة", "LCENSE", "LICENSE", "MOTOR", "VEHICLE"]):
-                            merged["owner_name"] = ov
-
-                    notes_parts = []
-                    if data.get("notes"):
-                        notes_parts.append(str(data.get("notes")))
-                    if llm_data.get("notes"):
-                        notes_parts.append(str(llm_data.get("notes")))
-                    merged["notes"] = " | ".join([p for p in notes_parts if p]).strip()
-
-                    data = merged
-            except SystemExit as exc:
-                data["notes"] = (
-                    (data.get("notes") or "")
-                    + " | LLM unavailable: "
-                    + str(exc)
-                ).strip()
 
         # Validate extracted data and add any inconsistency notes.
         _validate_and_note_data(data)
