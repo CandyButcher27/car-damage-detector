@@ -29,7 +29,6 @@ fsspec==2026.4.0
 future==1.0.0
 gast==0.7.0
 google-auth==2.53.0
-google-genai==2.6.0
 google-pasta==0.2.0
 grpcio==1.80.0
 h11==0.16.0
@@ -81,7 +80,6 @@ python-dateutil==2.9.0.post0
 python-multipart==0.0.29
 pytz==2026.2
 PyYAML==6.0.2
-requests==2.34.2
 rich==15.0.0
 ruamel.yaml==0.19.1
 scikit-learn==1.7.2
