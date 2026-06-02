@@ -70,7 +70,16 @@ CAR_FALLBACK_SIZE = 128
 PROCESS_TYPES = ("car", "mulkiya", "pdf", "file")
 
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="UpSure PoC Document and Car Pipeline")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _card_model: CardNonCardModel | None = None
 _car_model: Any | None = None
