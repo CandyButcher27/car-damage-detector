@@ -57,7 +57,6 @@ POC_DIR = Path(__file__).resolve().parent
 OCR_SCRIPT = POC_DIR / "ocr_simple_test.py"
 MODEL_PATH = _resolve_model_path(POC_DIR, None)
 CAR_MODEL_PATH    = POC_DIR / "models" / "best_car_model.keras"
-DAMAGE_MODEL_PATH = POC_DIR / "models" / "damage_model.onnx"
 DAMAGE_THRESHOLD  = 0.25
 DAMAGE_IMG_SIZE   = 260
 DAMAGE_MEAN       = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -75,6 +74,24 @@ OCR_PYTHON = Path(
 CAR_THRESHOLD = 0.35
 CAR_FALLBACK_SIZE = 128
 PROCESS_TYPES = ("car", "mulkiya", "pdf", "file")
+
+
+def _resolve_damage_model_path() -> Path:
+    env_path = os.getenv("UPSURE_DAMAGE_MODEL")
+    if env_path:
+        return Path(env_path)
+
+    candidates = [
+        POC_DIR / "models" / "damage_model.onnx",
+        POC_DIR / "models" / "digiLifeDoc_damage_model.onnx",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+DAMAGE_MODEL_PATH = _resolve_damage_model_path()
 
 
 app = FastAPI(title="UpSure PoC Document and Car Pipeline")
@@ -138,9 +155,19 @@ def _get_damage_session() -> ort.InferenceSession:
     if _damage_session is None:
         if not DAMAGE_MODEL_PATH.exists():
             raise FileNotFoundError(f"Damage model not found at {DAMAGE_MODEL_PATH}")
-        _damage_session = ort.InferenceSession(
-            str(DAMAGE_MODEL_PATH), providers=["CPUExecutionProvider"]
-        )
+        try:
+            _damage_session = ort.InferenceSession(
+                str(DAMAGE_MODEL_PATH), providers=["CPUExecutionProvider"]
+            )
+        except Exception as exc:
+            message = str(exc)
+            if ".onnx.data" in message:
+                raise RuntimeError(
+                    "Damage model is incomplete. "
+                    f"ONNX Runtime expects a companion external-data file next to {DAMAGE_MODEL_PATH.name}: "
+                    f"{DAMAGE_MODEL_PATH.name}.data"
+                ) from exc
+            raise RuntimeError(f"Failed to initialize damage model at {DAMAGE_MODEL_PATH}: {message}") from exc
     return _damage_session
 
 
@@ -535,10 +562,21 @@ def root():
 
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
+    damage_model_ready = True
+    damage_model_error = None
+    try:
+        _get_damage_session()
+    except Exception as exc:
+        damage_model_ready = False
+        damage_model_error = str(exc)
+
     return {
         "status": "ok",
         "model_path": str(MODEL_PATH),
         "car_model_path": str(CAR_MODEL_PATH),
+        "damage_model_path": str(DAMAGE_MODEL_PATH),
+        "damage_model_ready": damage_model_ready,
+        "damage_model_error": damage_model_error,
         "ocr_script": str(OCR_SCRIPT),
     }
 
@@ -789,7 +827,7 @@ async def predict_damage(
 
     try:
         _get_damage_session()
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
     per_view: dict[str, Any] = {}
