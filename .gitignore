@@ -1,0 +1,35 @@
+# Secrets
+.env
+
+# Data — never commit training images or labels
+carstrain/
+carstrain_new/
+carstrain_new_filtered/
+labels/
+dataset.csv
+dataset_verified.csv
+filter_results.csv
+
+# Model weights
+models/
+*.pth
+*.onnx
+*.onnx.data
+*.keras
+
+# Zips
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db

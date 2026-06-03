@@ -1,0 +1,56 @@
+paths:
+  image_dir:              carstrain
+  label_dir:              labels
+  dataset_csv:            dataset.csv
+  dataset_verified_csv:   dataset_verified.csv
+  model_pth:              models/damage_model.pth
+  model_onnx:             models/damage_model.onnx
+
+image:
+  extensions:      [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+  max_px:          1600
+  upscale_target:  1600
+  jpeg_quality:    92
+  unsharp_radius:  1.5
+  unsharp_percent: 120
+  unsharp_threshold: 3
+  contrast_factor: 1.15
+
+ollama:
+  model:       qwen3-vl:235b-instruct-cloud
+  base_url:    https://ollama.com
+  temperature: 0.1
+  max_tokens:  4096
+
+gemini:
+  model:               gemini-3-flash-preview
+  temperature:         0.1
+  max_tokens:          4096
+  high_conf_threshold: 0.85
+  clean_sample_rate:   0.30
+
+batch_label:
+  workers: 4
+
+gemini_verify:
+  workers: 3
+
+training:
+  model_name:   efficientnet_b2
+  img_size:     260
+  batch_size:   16
+  epochs:       25
+  lr:           0.0003
+  weight_decay: 0.0001
+  num_workers:  0
+  seed:         42
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+api:
+  host:               0.0.0.0
+  port:               8000
+  img_size:           260
+  damage_threshold:   0.25
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]

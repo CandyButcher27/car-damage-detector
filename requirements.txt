@@ -1,0 +1,13 @@
+openai==2.38.0
+google-genai
+timm==1.0.27
+albumentations==2.0.8
+fastapi==0.136.3
+uvicorn==0.48.0
+torch==2.12.0
+torchvision==0.27.0
+onnxruntime==1.20.1
+pillow==12.2.0
+scikit-learn==1.8.0
+python-dotenv==1.2.2
+tensorflow-cpu
