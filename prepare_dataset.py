@@ -15,7 +15,7 @@ from pathlib import Path
 
 from config import CFG
 
-IMAGE_DIRS = [Path(CFG["paths"]["image_dir"]), Path("carstrain_new_filtered")]
+IMAGE_DIRS = [Path(CFG["paths"]["image_dir"])]
 LABEL_DIR  = Path(CFG["paths"]["label_dir"])
 OUT_CSV    = Path(CFG["paths"]["dataset_csv"])
 

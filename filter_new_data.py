@@ -3,8 +3,11 @@ Extract new zip files, run car+card classifiers, save filter_results.csv.
 
 Usage:
     python filter_new_data.py              # extract + score (default thresholds)
-    python filter_new_data.py --apply      # also copy passing images to carstrain_new_filtered/
+    python filter_new_data.py --apply      # also copy passing images to images/
     python filter_new_data.py --car-thresh 0.7 --card-thresh 0.4 --apply
+
+    Zips are auto-discovered from project root (excludes data_raw/).
+    Drop any new zip into the project folder and re-run — no code edits needed.
 
 Thresholds:
     car_score  >= car_thresh  → passes car filter
@@ -22,12 +25,8 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-ZIP_FILES = [
-    "Documents_Vehicle_Front_View_01-06-2026.zip",
-    "Documents_Vehicle_Back_View_01-06-2026.zip",
-    "Documents_Vehicle_Left_View_01-06-2026.zip",
-    "Documents_Vehicle_Right_View_01-06-2026.zip",
-]
+ROOT     = Path(__file__).parent
+DATA_RAW = ROOT / "data_raw"
 
 CAR_MODEL_PATH  = "best_car_model (2).keras"
 CARD_MODEL_PATH = "card_noncard_classifier_model (1).keras"
@@ -35,20 +34,38 @@ CAR_INPUT_SIZE  = (128, 128)
 CARD_INPUT_SIZE = (224, 224)
 
 EXTRACT_DIR  = Path("carstrain_new")
-FILTERED_DIR = Path("carstrain_new_filtered")
+FILTERED_DIR = Path("images")
 RESULTS_CSV  = Path("filter_results.csv")
+
+
+def discover_zips() -> list[Path]:
+    return sorted(
+        p for p in ROOT.glob("*.zip")
+        if not (DATA_RAW / p.name).exists()
+    )
 
 
 def extract_zips():
     EXTRACT_DIR.mkdir(exist_ok=True)
+    zip_paths = discover_zips()
+    if not zip_paths:
+        print("  No new zips found in project root.")
+        return 0
+    print(f"  Found {len(zip_paths)} zip(s):")
+    for z in zip_paths:
+        print(f"    {z.name}")
     total = 0
-    for zname in ZIP_FILES:
-        zpath = Path(zname)
+    for zpath in zip_paths:
         if not zpath.exists():
-            print(f"  MISSING: {zname} — skipping")
+            print(f"  MISSING: {zpath.name} — skipping")
             continue
-        with zipfile.ZipFile(zpath) as z:
-            entries = z.namelist()
+        try:
+            zf = zipfile.ZipFile(zpath)
+        except zipfile.BadZipFile:
+            print(f"  SKIPPED (bad/incomplete zip): {zpath.name}")
+            continue
+        with zf:
+            entries = zf.namelist()
             skipped = 0
             extracted = 0
             for name in entries:
@@ -56,10 +73,10 @@ def extract_zips():
                 if dest.exists():
                     skipped += 1
                     continue
-                z.extract(name, EXTRACT_DIR)
+                zf.extract(name, EXTRACT_DIR)
                 extracted += 1
             total += len(entries)
-            print(f"  {zname}: {extracted} extracted, {skipped} already present ({len(entries)} total)")
+            print(f"  {zpath.name}: {extracted} extracted, {skipped} already present ({len(entries)} total)")
     return total
 
 
@@ -87,7 +104,7 @@ def main():
     parser.add_argument("--car-thresh",  type=float, default=0.7)
     parser.add_argument("--card-thresh", type=float, default=0.4)
     parser.add_argument("--apply",       action="store_true",
-                        help="Copy passing images to carstrain_new_filtered/")
+                        help="Copy passing images to images/")
     parser.add_argument("--batch-size",  type=int, default=32)
     args = parser.parse_args()
 
@@ -164,7 +181,7 @@ def main():
                 copied += 1
         print(f"  Copied {copied} images to {FILTERED_DIR}/")
 
-    print("\nDone. Next: run batch_label.py on carstrain_new_filtered/ once --apply used.")
+    print("\nDone. Next: run batch_label.py — new images already in images/.")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 carstrain/
 carstrain_new/
 carstrain_new_filtered/
+images/
 labels/
 dataset.csv
 dataset_verified.csv

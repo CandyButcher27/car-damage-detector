@@ -1,10 +1,18 @@
 paths:
-  image_dir:              carstrain
-  label_dir:              labels
-  dataset_csv:            dataset.csv
-  dataset_verified_csv:   dataset_verified.csv
-  model_pth:              models/damage_model.pth
-  model_onnx:             models/damage_model.onnx
+  image_dir:                  images
+  label_dir:                  labels
+  dataset_csv:                dataset.csv
+  dataset_verified_csv:       dataset_verified.csv
+  model_pth:                  models/damage_model.pth
+  model_onnx:                 models/damage_model_single.onnx
+  damage_type_dataset_csv:    damage_type_dataset.csv
+  damage_type_model_pth:      models/damage_type_model.pth
+  damage_type_model_onnx:     models/damage_type_model.onnx
+
+damage_type:
+  classes:    [Paint Damage, Scratch, Dent, Bumper Damage, Other]
+  threshold:  0.4
+  num_classes: 5
 
 image:
   extensions:      [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
