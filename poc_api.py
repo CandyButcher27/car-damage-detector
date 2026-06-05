@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from xml.etree import ElementTree
@@ -74,6 +75,20 @@ OCR_PYTHON = Path(
 CAR_THRESHOLD = 0.35
 CAR_FALLBACK_SIZE = 128
 PROCESS_TYPES = ("car", "mulkiya", "pdf", "file")
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+MODEL_IMAGE_SUFFIX = ".jpg"
+OCR_IMAGE_SUFFIX = ".png"
+PDF_SUFFIX = ".pdf"
+
+
+@dataclass(slots=True)
+class NormalizedInput:
+    path: Path
+    data: bytes
+    kind: Literal["image", "pdf", "file"]
+    mime_type: str
+    converted: bool
+    details: dict[str, Any]
 
 
 def _resolve_damage_model_path() -> Path:
@@ -252,8 +267,7 @@ def _is_pdf(upload: UploadFile) -> bool:
 def _is_image(upload: UploadFile) -> bool:
     filename = Path(upload.filename or "").name.lower()
     content_type = (upload.content_type or "").lower()
-    image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-    return content_type.startswith("image/") or any(filename.endswith(ext) for ext in image_exts)
+    return content_type.startswith("image/") or any(filename.endswith(ext) for ext in IMAGE_EXTENSIONS)
 
 
 def _guess_mime_type(upload: UploadFile, source_name: str) -> str:
@@ -262,6 +276,175 @@ def _guess_mime_type(upload: UploadFile, source_name: str) -> str:
         return content_type
     guessed, _ = mimetypes.guess_type(source_name)
     return guessed or "application/octet-stream"
+
+
+def _safe_stem(source_name: str) -> str:
+    stem = Path(source_name).stem.strip()
+    return stem or "upload"
+
+
+def _image_bytes_to_format(
+    file_bytes: bytes,
+    *,
+    output_format: Literal["JPEG", "PNG"],
+) -> tuple[bytes, dict[str, Any]]:
+    with Image.open(io.BytesIO(file_bytes)) as image:
+        original_format = image.format
+        original_mode = image.mode
+        original_size = [image.width, image.height]
+        prepared_image = ImageOps.exif_transpose(image)
+
+        if output_format == "JPEG":
+            prepared_image = prepared_image.convert("RGB")
+            suffix = MODEL_IMAGE_SUFFIX
+            mime_type = "image/jpeg"
+            save_kwargs: dict[str, Any] = {"format": "JPEG", "quality": 95, "optimize": True}
+        else:
+            if prepared_image.mode not in {"RGB", "RGBA", "L"}:
+                prepared_image = prepared_image.convert("RGB")
+            suffix = OCR_IMAGE_SUFFIX
+            mime_type = "image/png"
+            save_kwargs = {"format": "PNG"}
+
+        buffer = io.BytesIO()
+        prepared_image.save(buffer, **save_kwargs)
+
+    return buffer.getvalue(), {
+        "source_kind": "image",
+        "target_kind": "image",
+        "target_suffix": suffix,
+        "target_mime_type": mime_type,
+        "original_format": original_format,
+        "original_mode": original_mode,
+        "original_size": original_size,
+        "converted": True,
+    }
+
+
+def _pdf_first_page_to_jpeg(file_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
+    try:
+        import fitz
+    except ImportError as exc:
+        raise RuntimeError("PyMuPDF is required to convert PDFs into images for this process_type.") from exc
+
+    with fitz.open(stream=file_bytes, filetype="pdf") as document:
+        if document.page_count < 1:
+            raise RuntimeError("PDF has no pages to convert.")
+        page = document.load_page(0)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        png_bytes = pixmap.tobytes("png")
+
+    jpeg_bytes, image_details = _image_bytes_to_format(png_bytes, output_format="JPEG")
+    image_details.update(
+        {
+            "source_kind": "pdf",
+            "target_kind": "image",
+            "target_suffix": MODEL_IMAGE_SUFFIX,
+            "target_mime_type": "image/jpeg",
+            "pdf_page_used": 1,
+        }
+    )
+    return jpeg_bytes, image_details
+
+
+def _image_bytes_to_pdf(file_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
+    with Image.open(io.BytesIO(file_bytes)) as image:
+        original_format = image.format
+        original_mode = image.mode
+        original_size = [image.width, image.height]
+        prepared_image = ImageOps.exif_transpose(image).convert("RGB")
+        buffer = io.BytesIO()
+        prepared_image.save(buffer, format="PDF", resolution=200.0)
+
+    return buffer.getvalue(), {
+        "source_kind": "image",
+        "target_kind": "pdf",
+        "target_suffix": PDF_SUFFIX,
+        "target_mime_type": "application/pdf",
+        "original_format": original_format,
+        "original_mode": original_mode,
+        "original_size": original_size,
+        "converted": True,
+    }
+
+
+def _write_normalized(temp_dir: Path, source_name: str, suffix: str, data: bytes) -> Path:
+    path = temp_dir / f"{_safe_stem(source_name)}_normalized{suffix}"
+    path.write_bytes(data)
+    return path
+
+
+def _normalize_for_image_model(
+    *,
+    file_bytes: bytes,
+    source_name: str,
+    temp_dir: Path,
+    is_pdf_file: bool,
+) -> NormalizedInput:
+    if is_pdf_file:
+        data, details = _pdf_first_page_to_jpeg(file_bytes)
+    else:
+        data, details = _image_bytes_to_format(file_bytes, output_format="JPEG")
+
+    path = _write_normalized(temp_dir, source_name, MODEL_IMAGE_SUFFIX, data)
+    return NormalizedInput(
+        path=path,
+        data=data,
+        kind="image",
+        mime_type="image/jpeg",
+        converted=True,
+        details=details,
+    )
+
+
+def _normalize_for_ocr(
+    *,
+    file_bytes: bytes,
+    source_name: str,
+    temp_dir: Path,
+    is_pdf_file: bool,
+    target_pdf: bool,
+) -> NormalizedInput:
+    if is_pdf_file:
+        converted = Path(source_name).suffix.lower() != PDF_SUFFIX
+        path = _write_normalized(temp_dir, source_name, PDF_SUFFIX, file_bytes)
+        return NormalizedInput(
+            path=path,
+            data=file_bytes,
+            kind="pdf",
+            mime_type="application/pdf",
+            converted=converted,
+            details={
+                "source_kind": "pdf",
+                "target_kind": "pdf",
+                "target_suffix": PDF_SUFFIX,
+                "target_mime_type": "application/pdf",
+                "converted": converted,
+            },
+        )
+
+    if target_pdf:
+        data, details = _image_bytes_to_pdf(file_bytes)
+        path = _write_normalized(temp_dir, source_name, PDF_SUFFIX, data)
+        return NormalizedInput(
+            path=path,
+            data=data,
+            kind="pdf",
+            mime_type="application/pdf",
+            converted=True,
+            details=details,
+        )
+
+    data, details = _image_bytes_to_format(file_bytes, output_format="PNG")
+    path = _write_normalized(temp_dir, source_name, OCR_IMAGE_SUFFIX, data)
+    return NormalizedInput(
+        path=path,
+        data=data,
+        kind="image",
+        mime_type="image/png",
+        converted=True,
+        details=details,
+    )
 
 
 def _mean_confidence(payload: Any) -> float:
@@ -337,6 +520,140 @@ def _flatten_ocr_lines(payload: Any) -> list[dict[str, Any]]:
             )
 
     return lines
+
+
+MULKIYA_FIELD_LABELS_EN = {
+    "plate_number": "Plate number",
+    "plate_text": "Plate letters",
+    "vehicle_type": "Vehicle type",
+    "make": "Make",
+    "model": "Model",
+    "color": "Color",
+    "year": "Model year",
+    "vin_or_chassis": "VIN or chassis number",
+    "engine_cc": "Engine capacity (cc)",
+    "empty_weight_kg": "Empty weight (kg)",
+    "max_load_kg": "Maximum load (kg)",
+    "seats": "Seats",
+    "issue_date": "Issue date",
+    "expiry_date": "Expiry date",
+    "owner_name": "Owner name",
+    "notes": "Notes",
+}
+
+ARABIC_VALUE_TRANSLATIONS = {
+    "خصوصي": "Private",
+    "بب": "Ba Ba (Arabic plate letters)",
+    "تويوتا": "Toyota",
+    "كورولا": "Corolla",
+    "صالون": "Sedan",
+    "تويوتا صالون كورولا": "Toyota Corolla sedan",
+    "ابيض": "White",
+    "أبيض": "White",
+    "الولايات": "United States",
+    "المتحدة الامريكية": "United States of America",
+    "الولايات المتحدة الامريكية": "United States of America",
+    "عمان": "Oman",
+    "سلطنة": "Sultanate",
+    "سلطنة عمان": "Sultanate of Oman",
+    "شرطة": "Police",
+    "شرطة عمان": "Oman Police",
+    "السلطائية": "Royal",
+    "الادارة": "Directorate",
+    "العامة": "General",
+    "للمرور": "Traffic",
+    "رخصة": "License",
+    "مركبة": "Vehicle",
+    "رخصة مركبة": "Vehicle license",
+    "رقم": "Number",
+    "اللوحة": "Plate",
+    "الوحة": "Plate",
+    "نوع": "Type",
+    "نوع الوحة": "Plate type",
+    "نوع المركبة": "Vehicle type",
+    "اللون": "Color",
+    "المنشاء": "Origin",
+    "سنة الطرار": "Model year",
+    "سنة الصلع": "Manufacture year",
+    "سعة المحرك": "Engine capacity",
+    "الوزن": "Weight",
+    "فارغ": "Empty",
+    "الحمولة": "Load",
+    "القصوى": "Maximum",
+    "كجم": "kg",
+    "عدد الركاب": "Number of passengers",
+    "عدد المحاور": "Number of axles",
+    "رقم الاعدةالشاص": "Chassis number",
+    "رقم المحرة": "Engine number",
+    "الرخصة من": "License from",
+    "صلاحية": "Validity",
+}
+
+
+def _translate_text_local(text: Any) -> str | None:
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        return str(text)
+
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return ""
+    if cleaned in ARABIC_VALUE_TRANSLATIONS:
+        return ARABIC_VALUE_TRANSLATIONS[cleaned]
+
+    translated = cleaned
+    for source, target in sorted(ARABIC_VALUE_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True):
+        translated = translated.replace(source, target)
+    return translated
+
+
+def _translate_extracted_data_local(extracted_data: Any) -> Any:
+    if not isinstance(extracted_data, dict):
+        return extracted_data
+
+    translated: dict[str, Any] = {}
+    for key, value in extracted_data.items():
+        if key == "source":
+            continue
+        label = MULKIYA_FIELD_LABELS_EN.get(key, key.replace("_", " ").title())
+        translated_value = _translate_text_local(value) if isinstance(value, str) else value
+        translated[key] = {
+            "label": label,
+            "value": value,
+            "translation": translated_value,
+        }
+    return translated
+
+
+def _translate_ocr_payload_local(raw_ocr: Any) -> Any:
+    lines = _flatten_ocr_lines(raw_ocr)
+    return {
+        "line_count": len(lines),
+        "lines": [
+            {
+                "page": line.get("page"),
+                "line_index": line.get("line_index"),
+                "text": line.get("text"),
+                "translation": _translate_text_local(line.get("text")),
+                "confidence": line.get("confidence"),
+            }
+            for line in lines
+        ],
+    }
+
+
+def _build_translation_payload(extracted_data: Any, raw_ocr: Any) -> dict[str, Any]:
+    return {
+        "target_language": "en",
+        "provider": "local_dictionary",
+        "note": (
+            "Local helper translation for Mulkiya review. It translates known OCR "
+            "labels and common values, and leaves unknown text unchanged."
+        ),
+        "extracted_data": _translate_extracted_data_local(extracted_data),
+        "raw_ocr": _translate_ocr_payload_local(raw_ocr) if raw_ocr is not None else None,
+    }
 
 
 def _run_ocr_script(
@@ -517,6 +834,8 @@ def _build_pipeline_response(
     chunk_source_path: Path | None,
     note: str,
     car_classification: dict[str, Any] | None = None,
+    normalized_input: NormalizedInput | None = None,
+    translation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if chunk_source_path and chunk_source_path.exists():
         chunks = [
@@ -535,10 +854,20 @@ def _build_pipeline_response(
         rag_chunks = []
         artifact_chunk_source = None
 
-    return {
+    response = {
         "input": {
             "filename": source_name,
             "kind": input_kind,
+            "normalized": (
+                {
+                    "kind": normalized_input.kind,
+                    "mime_type": normalized_input.mime_type,
+                    "converted": normalized_input.converted,
+                    "details": normalized_input.details,
+                }
+                if normalized_input
+                else None
+            ),
         },
         "classification": classification,
         "car_classification": car_classification,
@@ -551,6 +880,9 @@ def _build_pipeline_response(
         },
         "note": note,
     }
+    if translation is not None:
+        response["translation"] = translation
+    return response
 
 
 @app.get("/")
@@ -585,17 +917,30 @@ async def health_check() -> dict[str, Any]:
 async def predict_car(file: UploadFile = File(...)) -> dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="File provided is not an image.")
 
-    try:
-        image = _load_image_bytes(await file.read())
-        classification = _classify_car_image_from_image(image)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Error processing image: {str(exc)}")
+    source_name = Path(file.filename).name
+    is_pdf_file = _is_pdf(file)
+    with tempfile.TemporaryDirectory(prefix="upsure-car-") as temp_dir_name:
+        try:
+            normalized = _normalize_for_image_model(
+                file_bytes=await file.read(),
+                source_name=source_name,
+                temp_dir=Path(temp_dir_name),
+                is_pdf_file=is_pdf_file,
+            )
+            image = _load_image_bytes(normalized.data)
+            classification = _classify_car_image_from_image(image)
+        except Exception as exc:
+            raise HTTPException(status_code=415, detail=f"Could not convert uploaded file to a model image: {str(exc)}")
 
     return {
-        "filename": Path(file.filename).name,
+        "filename": source_name,
+        "normalized": {
+            "kind": normalized.kind,
+            "mime_type": normalized.mime_type,
+            "converted": normalized.converted,
+            "details": normalized.details,
+        },
         **classification,
     }
 
@@ -608,6 +953,7 @@ async def process_document(
     ocr_lang: str = Form("ar"),
     prefer_pdf_text: bool = Form(False),
     skip_ocr: bool = Form(False),
+    translate_to_en: bool = Form(False),
 ) -> dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
@@ -618,20 +964,9 @@ async def process_document(
             detail=f"process_type must be one of: {', '.join(PROCESS_TYPES)}",
         )
 
-    if process_type != "file" and not _is_pdf(file) and not _is_image(file):
-        raise HTTPException(status_code=415, detail="Please upload a PDF or image file.")
-
     source_name = Path(file.filename).name
     is_pdf_file = _is_pdf(file)
-    is_image_file = _is_image(file)
     mime_type = _guess_mime_type(file, source_name)
-
-    if process_type == "pdf" and not is_pdf_file:
-        raise HTTPException(status_code=400, detail="process_type='pdf' requires a PDF file.")
-    if process_type in {"car", "mulkiya"} and not is_image_file and not is_pdf_file:
-        raise HTTPException(status_code=400, detail="process_type='car' or 'mulkiya' requires an image or PDF file.")
-    if process_type == "car" and is_pdf_file:
-        raise HTTPException(status_code=400, detail="process_type='car' requires an image file, not PDF.")
 
     with tempfile.TemporaryDirectory(prefix="upsure-poc-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -664,20 +999,26 @@ async def process_document(
                 chunk_source_path=details_path,
                 note=note,
                 car_classification=None,
+                translation=_build_translation_payload(details, None) if translate_to_en else None,
             )
 
         if process_type == "car":
             try:
-                image = _load_image_bytes(file_bytes)
+                normalized = _normalize_for_image_model(
+                    file_bytes=file_bytes,
+                    source_name=source_name,
+                    temp_dir=temp_dir,
+                    is_pdf_file=is_pdf_file,
+                )
+                image = _load_image_bytes(normalized.data)
                 car_classification = _classify_car_image_from_image(image)
                 confidence_score = car_classification.get("confidence", 0.0)
                 note = "Car classification model executed."
             except Exception as exc:
-                car_classification = {
-                    "error": str(exc),
-                }
-                confidence_score = 0.0
-                note = f"Car classification model failed: {exc}"
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"Could not convert uploaded file to a car model image: {exc}",
+                )
 
             return _build_pipeline_response(
                 source_name=source_name,
@@ -689,11 +1030,24 @@ async def process_document(
                 chunk_source_path=None,
                 note=note,
                 car_classification=car_classification,
+                normalized_input=normalized,
             )
 
         if process_type == "mulkiya":
             if not is_pdf_file:
-                image = _load_image_bytes(file_bytes)
+                try:
+                    model_input = _normalize_for_image_model(
+                        file_bytes=file_bytes,
+                        source_name=source_name,
+                        temp_dir=temp_dir,
+                        is_pdf_file=False,
+                    )
+                    image = _load_image_bytes(model_input.data)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=415,
+                        detail=f"Could not convert uploaded file to a Mulkiya model image: {exc}",
+                    )
                 probability = _get_card_model().predict_probability(
                     image,
                     normalize=True,
@@ -706,6 +1060,7 @@ async def process_document(
                 }
                 confidence_score = probability
             else:
+                model_input = None
                 classification = {
                     "label": "unknown",
                     "reason": "PDF Mulkiya classification requires OCR.",
@@ -725,23 +1080,36 @@ async def process_document(
                     chunk_source_path=None,
                     note=note,
                     car_classification=None,
+                    normalized_input=model_input,
                 )
 
-            input_path.write_bytes(file_bytes)
+            try:
+                ocr_input = _normalize_for_ocr(
+                    file_bytes=file_bytes,
+                    source_name=source_name,
+                    temp_dir=temp_dir,
+                    is_pdf_file=is_pdf_file,
+                    target_pdf=False,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"Could not convert uploaded file to an OCR-supported format: {exc}",
+                )
             _run_ocr_script(
-                input_path,
+                ocr_input.path,
                 lang=ocr_lang,
                 extract_mulkya=True,
-                is_pdf=is_pdf_file,
-                prefer_pdf_text=prefer_pdf_text if is_pdf_file else False,
+                is_pdf=ocr_input.kind == "pdf",
+                prefer_pdf_text=prefer_pdf_text if ocr_input.kind == "pdf" else False,
             )
 
-            ocr_json_path = input_path.with_name(f"{input_path.stem}_ocr.json")
+            ocr_json_path = ocr_input.path.with_name(f"{ocr_input.path.stem}_ocr.json")
             if not ocr_json_path.exists():
                 raise HTTPException(status_code=500, detail="OCR JSON output was not created.")
 
             raw_ocr = _load_json(ocr_json_path)
-            extracted_data_path = input_path.with_name(f"{input_path.stem}_mulkya.json")
+            extracted_data_path = ocr_input.path.with_name(f"{ocr_input.path.stem}_mulkya.json")
 
             if extracted_data_path.exists():
                 extracted_data = _load_json(extracted_data_path)
@@ -765,19 +1133,33 @@ async def process_document(
                 chunk_source_path=chunk_source_path,
                 note=note,
                 car_classification=None,
+                normalized_input=ocr_input,
+                translation=_build_translation_payload(extracted_data, raw_ocr) if translate_to_en else None,
             )
 
         if process_type == "pdf":
-            input_path.write_bytes(file_bytes)
+            try:
+                normalized = _normalize_for_ocr(
+                    file_bytes=file_bytes,
+                    source_name=source_name,
+                    temp_dir=temp_dir,
+                    is_pdf_file=is_pdf_file,
+                    target_pdf=True,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"Could not convert uploaded file to PDF for OCR: {exc}",
+                )
             _run_ocr_script(
-                input_path,
+                normalized.path,
                 lang=ocr_lang,
                 extract_mulkya=False,
-                is_pdf=is_pdf_file,
-                prefer_pdf_text=prefer_pdf_text if is_pdf_file else False,
+                is_pdf=True,
+                prefer_pdf_text=prefer_pdf_text,
             )
 
-            ocr_json_path = input_path.with_name(f"{input_path.stem}_ocr.json")
+            ocr_json_path = normalized.path.with_name(f"{normalized.path.stem}_ocr.json")
             if not ocr_json_path.exists():
                 raise HTTPException(status_code=500, detail="OCR JSON output was not created.")
 
@@ -798,6 +1180,8 @@ async def process_document(
                 chunk_source_path=ocr_json_path,
                 note=note,
                 car_classification=None,
+                normalized_input=normalized,
+                translation=_build_translation_payload(extracted_data, raw_ocr) if translate_to_en else None,
             )
 
     raise HTTPException(status_code=500, detail="Unhandled process_type.")
@@ -834,15 +1218,36 @@ async def predict_damage(
     overall_damaged = False
     max_confidence = 0.0
 
-    for view_name, upload in views.items():
-        img_bytes = await upload.read()
-        arr = _preprocess_for_damage(img_bytes)
-        pred = _run_damage_inference(arr)
-        per_view[view_name] = pred
-        if pred["damage_detected"]:
-            overall_damaged = True
-        if pred["confidence_score"] > max_confidence:
-            max_confidence = pred["confidence_score"]
+    with tempfile.TemporaryDirectory(prefix="upsure-damage-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        for view_name, upload in views.items():
+            if not upload.filename:
+                raise HTTPException(status_code=400, detail=f"{view_name} upload must have a filename.")
+            try:
+                normalized = _normalize_for_image_model(
+                    file_bytes=await upload.read(),
+                    source_name=Path(upload.filename).name,
+                    temp_dir=temp_dir,
+                    is_pdf_file=_is_pdf(upload),
+                )
+                arr = _preprocess_for_damage(normalized.data)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"Could not convert {view_name} upload to a damage model image: {exc}",
+                )
+            pred = _run_damage_inference(arr)
+            pred["normalized"] = {
+                "kind": normalized.kind,
+                "mime_type": normalized.mime_type,
+                "converted": normalized.converted,
+                "details": normalized.details,
+            }
+            per_view[view_name] = pred
+            if pred["damage_detected"]:
+                overall_damaged = True
+            if pred["confidence_score"] > max_confidence:
+                max_confidence = pred["confidence_score"]
 
     return {
         "damage_detected":      overall_damaged,

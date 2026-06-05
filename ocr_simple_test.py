@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import re
 import sys
@@ -28,8 +29,37 @@ def _normalize_lines(result: object) -> list:
     if not result:
         return []
 
+    def from_mapping(item: object) -> list:
+        if not hasattr(item, "get"):
+            return []
+
+        texts = item.get("rec_texts")
+        if texts is None:
+            texts = []
+        scores = item.get("rec_scores")
+        if scores is None:
+            scores = []
+        boxes = None
+        for key in ("rec_polys", "dt_polys", "rec_boxes"):
+            candidate = item.get(key)
+            if candidate is not None and len(candidate) > 0:
+                boxes = candidate
+                break
+        if boxes is None:
+            boxes = []
+        lines = []
+        for box, text, score in zip(boxes, texts, scores):
+            if hasattr(box, "tolist"):
+                box = box.tolist()
+            lines.append((box, (text, float(score))))
+        return lines
+
     if isinstance(result, list) and result:
         first = result[0]
+        # PaddleOCR 3.x returns one mapping-like OCRResult per input.
+        mapped = from_mapping(first)
+        if mapped:
+            return mapped
         # Some versions may return a flat list of [box, (text, conf)] entries.
         if (
             isinstance(first, (list, tuple))
@@ -43,6 +73,48 @@ def _normalize_lines(result: object) -> list:
             return first
 
     return []
+
+
+def _build_paddleocr_kwargs(args: argparse.Namespace, paddleocr_cls: object) -> dict:
+    params = inspect.signature(paddleocr_cls).parameters
+
+    if "text_recognition_batch_size" in params:
+        kwargs = {
+            "lang": args.lang,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": args.use_angle_cls,
+            "enable_mkldnn": args.enable_mkldnn,
+            "cpu_threads": args.cpu_threads,
+            "text_recognition_batch_size": args.rec_batch_num,
+            "textline_orientation_batch_size": args.cls_batch_num,
+            "text_det_limit_side_len": args.det_limit_side_len,
+        }
+        kwargs["device"] = f"gpu:{args.gpu_id}" if args.use_gpu else "cpu"
+        return kwargs
+
+    return {
+        "use_angle_cls": args.use_angle_cls,
+        "lang": args.lang,
+        "use_gpu": args.use_gpu,
+        "gpu_id": args.gpu_id,
+        "enable_mkldnn": args.enable_mkldnn,
+        "cpu_threads": args.cpu_threads,
+        "rec_batch_num": args.rec_batch_num,
+        "cls_batch_num": args.cls_batch_num,
+        "det_limit_side_len": args.det_limit_side_len,
+        "show_log": False,
+    }
+
+
+def _run_paddle_ocr(ocr: object, image: object, *, use_angle_cls: bool) -> object:
+    predict = getattr(ocr, "predict", None)
+    if callable(predict):
+        params = inspect.signature(predict).parameters
+        if "use_textline_orientation" in params:
+            return predict(image, use_textline_orientation=use_angle_cls)
+
+    return ocr.ocr(image, cls=use_angle_cls)
 
 
 def _get_annotation_font(font_size: int):
@@ -84,6 +156,7 @@ def _field_label_map() -> dict[str, str]:
         "model": "الطراز",
         "color": "اللون",
         "year": "سنة الصنع",
+        "model_year": "سنة الطراز",
         "country_of_origin": "بلد المنشأ",
         "vin_or_chassis": "رقم الشاصي",
         "engine_number": "رقم المحرك",
@@ -332,7 +405,8 @@ def _apply_ocr_postprocessing(lines: list, enable_reshape: bool = True) -> list:
 
 def _validate_and_note_data(data: dict) -> None:
     """In-place validation: add issues to 'validation_notes' if data looks wrong."""
-    notes: list[str] = []
+    existing_notes = data.get("validation_notes")
+    notes: list[str] = list(existing_notes) if isinstance(existing_notes, list) else []
 
     # VIN/Chassis: should be 11-20 chars when present.
     vin = data.get("vin_or_chassis")
@@ -385,15 +459,13 @@ def _validate_and_note_data(data: dict) -> None:
 def _group_ocr_lines_by_field(lines: list[str]) -> dict[str, list[str]]:
     """Group OCR lines by detected field labels (Arabic labels often appear inline).
 
-    Note: Disabled for now due to Arabic presentation-form mismatches after reshaping.
     Returns all lines in '_other' for direct use by downstream extractors.
     """
-    # TODO: Fix label matching to work with presentation forms from arabic-reshaper
     return {"_other": lines}
 
 
 def _fix_reversed_arabic_runs(text: str) -> str:
-    # Some OCR outputs Arabic glyphs in reverse logical order (e.g. "ةنطلس" instead of "سلطنة").
+    # Some OCR engines output Arabic glyphs in reverse logical order.
     # Fix by reversing only Arabic-character runs; keep numbers/Latin intact.
     if not text:
         return text
@@ -440,12 +512,13 @@ def _postprocess_ocr_line(
     downstream consumers automatically: annotated image labels, text-file writers,
     and rule-based Mulkiya extractor.
 
-    Pipeline (in order):
-      1. Reverse-run fix  -- corrects glyphs emitted in wrong logical order by some
-                             OCR models (e.g. "ةنطلس" -> "سلطنة").
-      2. Arabic reshaper  -- reconnects isolated presentation-form glyphs into proper
-                             joined Unicode forms so that NLP tools can read
-                             the words correctly (e.g. ي ر ا ك -> كاري).
+    Optional pipeline steps:
+      1. Reverse-run fix -- corrects glyphs emitted in wrong logical order by
+         some OCR models. PaddleOCR's Arabic model already returns logical
+         order, so this must stay off by default.
+      2. Arabic reshaper -- useful for drawing connected glyphs on images, but
+         it creates presentation-form characters that make rule extraction and
+         JSON consumers harder to work with. Keep it off for stored OCR text.
 
     Both steps are no-ops for non-Arabic languages.
     """
@@ -511,6 +584,37 @@ def _sort_lines(lines: list, rtl: bool) -> list:
 def _extract_mulkya_rulebased(lines: list[str]) -> dict:
     # Lightweight heuristic extractor for Omani Mulkiya-like layouts.
     joined = "\n".join(lines)
+    joined_ascii = _convert_arabic_indic_digits_to_ascii(joined)
+    lines_ascii = [_convert_arabic_indic_digits_to_ascii(ln) for ln in lines]
+
+    field_label_terms = [
+        "اللوحة",
+        "الوحة",
+        "نوع",
+        "المركبة",
+        "اللون",
+        "المنشاء",
+        "سنة",
+        "الطرار",
+        "الصنع",
+        "الصلع",
+        "المحرك",
+        "الوزن",
+        "فارغ",
+        "الحمولة",
+        "الركاب",
+        "المحاور",
+        "الشاص",
+        "الشاصي",
+        "القاعدة",
+        "الاعدة",
+        "المحرة",
+        "الرخصة",
+        "صلاحية",
+    ]
+
+    def is_field_label(line: str) -> bool:
+        return any(term in line for term in field_label_terms)
 
     def find_after(keyword: str) -> str | None:
         for i, ln in enumerate(lines):
@@ -519,43 +623,94 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
                 return nxt or None
         return None
 
-    def find_number_near(keyword: str, max_lookahead: int = 6) -> int | None:
+    def find_number_near(
+        keyword: str,
+        max_lookahead: int = 4,
+        *,
+        min_value: int | None = None,
+        max_value: int | None = None,
+    ) -> int | None:
         for i, ln in enumerate(lines):
             if keyword in ln:
                 for j in range(i, min(i + max_lookahead, len(lines))):
-                    m = re.search(r"\b\d{1,5}\b", lines[j])
-                    if m:
+                    candidate_line = lines[j]
+                    if j > i and is_field_label(candidate_line):
+                        break
+                    for m in re.finditer(r"\b\d{1,5}\b", candidate_line):
                         try:
-                            return int(m.group(0))
+                            value = int(m.group(0))
                         except Exception:
-                            return None
+                            continue
+                        if min_value is not None and value < min_value:
+                            continue
+                        if max_value is not None and value > max_value:
+                            continue
+                        return value
         return None
 
     def find_date() -> list[str]:
         out: list[str] = []
-        for ln in lines:
-            m = re.search(r"\b\d{2,4}/\d{1,2}/\d{1,2}\b", ln)
-            if m:
-                out.append(m.group(0))
+        for ln in lines_ascii:
+            for m in re.finditer(r"\b\d{2,4}/\d{1,2}/\d{1,2}\b", ln):
+                value = m.group(0)
+                if value not in out:
+                    out.append(value)
         return out
 
-    # plate
+    def date_key(value: str) -> tuple[int, int, int] | None:
+        m = re.fullmatch(r"(\d{2,4})/(\d{1,2})/(\d{1,2})", value)
+        if not m:
+            return None
+        y, mo, d = (int(part) for part in m.groups())
+        if y < 100:
+            y += 2000
+        return (y, mo, d)
+
+    def numeric_tokens(text: str) -> list[int]:
+        text = _convert_arabic_indic_digits_to_ascii(text)
+        text = re.sub(r"\b\d{2,4}/\d{1,2}/\d{1,2}\b", " ", text)
+        values: list[int] = []
+        for raw in re.findall(r"\d+", text):
+            pieces = [raw]
+            if len(raw) == 8:
+                left, right = raw[:4], raw[4:]
+                if 100 <= int(left) <= 100000 and 100 <= int(right) <= 100000:
+                    pieces = [left, right]
+            for piece in pieces:
+                try:
+                    values.append(int(piece))
+                except Exception:
+                    continue
+        return values
+
+    all_numbers = numeric_tokens(joined_ascii)
+
     plate_number = None
-    # Try multiple label variations (including presentation forms from reshaping)
-    plate_labels = ["اللوحة", "رقم اللوحة", "رقم", "ﺍﻟﻠﻮﺣﺔ", "ﺮﻗﻢ"]
+    plate_text = None
+    # Try plate-specific label variations. Do not use generic "رقم" because
+    # Mulkiya has many other numbered fields.
+    plate_labels = ["اللوحة", "الوحة", "رقم اللوحة", "رقم الوحة", "ﺍﻟﻠﻮﺣﺔ"]
+    plate_token_skip = {"رقم", "اللوحة", "الوحة", "نوع", "خصوصي"}
     for i, ln in enumerate(lines):
-        if any(label in ln for label in plate_labels) and i + 1 < len(lines):
-            m = re.search(r"\b\d{3,7}\b", lines[i + 1])
-            if m:
-                plate_number = m.group(0)
+        if not any(label in ln for label in plate_labels) or "نوع" in ln:
+            continue
+        window = " ".join(lines[max(0, i - 2) : min(len(lines), i + 4)])
+        for m in re.finditer(r"\b\d{3,7}\b", window):
+            if re.search(r"\d{2,4}/\d{1,2}/\d{1,2}", window):
+                continue
+            plate_number = m.group(0)
+            break
+        if plate_number:
+            break
+        for token in re.findall(r"(?<![\u0600-\u06FF])[\u0621-\u064A]{1,3}(?![\u0600-\u06FF])", window):
+            if token not in plate_token_skip:
+                plate_text = token
                 break
-    if plate_number is None:
-        m = re.search(r"\b\d{3,7}\b", joined)
-        plate_number = m.group(0) if m else None
+        break
 
     # Prefer explicit plate pattern: 5 digits followed by an Arabic letter
     try:
-        pat = re.search(r"([\u0660-\u0669\u06F0-\u06F90-9]{5}\s*[\u0600-\u06FF])", joined)
+        pat = re.search(r"([\u0660-\u0669\u06F0-\u06F90-9]{5}\s*[\u0600-\u06FF])", joined_ascii)
         if pat:
             raw = pat.group(1)
             # Extract the 5-digit portion and the Arabic letter
@@ -568,6 +723,19 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
     except Exception:
         pass
 
+    if not plate_number:
+        # The Arabic recognizer often sees the Arabic plate letters while the
+        # English recognizer sees the numeric portion. Pick the first plausible
+        # 3-7 digit token that is not a date/year/vehicle-spec value.
+        plate_candidates = [value for value in all_numbers if 10000 <= value <= 9999999]
+        plate_candidates.extend(value for value in all_numbers if 100 <= value <= 9999)
+        for value in plate_candidates:
+            if 100 <= value <= 9999999:
+                if 1900 <= value <= 2100:
+                    continue
+                plate_number = str(value)
+                break
+
     def extract_vin(text: str) -> str | None:
         """Extract VIN/chassis from text, prioritizing alphanumeric sequences of 11-20 chars.
 
@@ -578,11 +746,12 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
         single_artifacts = {
             "VEHICLE", "MOTOR", "ENGINE", "LICENSE", "LCENSE", "TIRAFIIC",
             "SULTANATE", "OMAN", "POLICE", "ROYA", "ROYAL", "KINGDOM",
+            "GENERALOFTRAFFIC", "GENERAL", "TRAFFIC",
         }
         # Compound artifacts (concatenations of single artifacts)
         compound_artifacts = {
             "VEHICLEMOTOR", "MOTORVEHICLE", "ENGINEMOTOR", "MOTORENGINE",
-            "POLICEOMATIC", "SULTANATEOMAN",  # add common composites
+            "POLICEOMATIC", "SULTANATEOMAN", "DIRGENERALOFTRAFFIC",
         }
         all_artifacts = single_artifacts | compound_artifacts
 
@@ -618,31 +787,33 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
 
         # De-duplicate and rank by length (prefer 17-char, then longest).
         uniq_dict = {c: l for c, l in candidates}
+        exact_17 = [
+            c
+            for c, l in uniq_dict.items()
+            if l == 17 and re.search(r"[A-Z]", c) and re.search(r"\d", c)
+        ]
+        if exact_17:
+            return exact_17[0]
         
-        # Prefer candidates starting with letters (typical VIN format)
+        # Prefer candidates starting with letters only after exact VIN-length
+        # candidates have been considered. Some real VINs start with digits.
         letter_start = {c: l for c, l in uniq_dict.items() if c and c[0].isalpha()}
-        num_start = {c: l for c, l in uniq_dict.items() if c and c[0].isdigit()}
-        
-        # Try letter-starting candidates first
         pool = letter_start if letter_start else uniq_dict
-        best_17 = [(c, l) for c, l in pool.items() if l == 17]
-        if best_17:
-            return best_17[0][0]
         
         # Fall back to longest from available pool
         return max(pool.items(), key=lambda x: x[1])[0]
 
     vin_or_chassis = None
-    label_keys = ["الشاصي", "شاصي", "chassis", "vin", "رقم القاعدة", "القاعدة"]
+    label_keys = ["الشاص", "الشاصي", "شاصي", "chassis", "vin", "رقم القاعدة", "القاعدة", "الاعدة"]
     for i, ln in enumerate(lines):
-        if any(k in ln.lower() for k in label_keys if isinstance(k, str)) or any(k in ln for k in ["الشاصي", "القاعدة", "رقم"]):
+        if any(k in ln.lower() for k in label_keys if isinstance(k, str)):
             window = "\n".join(lines[max(0, i - 2) : min(len(lines), i + 8)])
             cand = extract_vin(window)
             if cand:
                 vin_or_chassis = cand
                 break
-    if vin_or_chassis is None:
-        vin_or_chassis = extract_vin(joined)
+    if not vin_or_chassis:
+        vin_or_chassis = extract_vin(joined_ascii)
 
     make = None
     for brand in ["تويوتا", "نيسان", "هيونداي", "كيا", "هوندا", "مرسيدس", "بي ام", "BMW", "LEXUS", "لكزس"]:
@@ -655,19 +826,24 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
             model = mdl
             break
     color = find_after("اللون")
+    country_of_origin = None
+    if "الولايات" in joined and ("المتحدة" in joined or "الامريكية" in joined):
+        country_of_origin = "الولايات المتحدة الامريكية"
 
     vehicle_type = "خصوصي" if "خصوصي" in joined else None
 
-    engine_cc = find_number_near("المحرك")
-    empty_weight_kg = find_number_near("فارغ") or find_number_near("الوزن")
-    max_load_kg = find_number_near("الحمولة")
-    seats = find_number_near("الركاب", max_lookahead=3)
+    engine_cc = find_number_near("المحرك", min_value=200, max_value=10000)
+    empty_weight_kg = find_number_near("فارغ", min_value=100, max_value=10000) or find_number_near("الوزن", min_value=100, max_value=10000)
+    max_load_kg = find_number_near("الحمولة", min_value=100, max_value=100000)
+    seats = find_number_near("الركاب", max_lookahead=3, min_value=1, max_value=80)
+    engine_number = "NIL" if re.search(r"\bNIL\b", joined_ascii, flags=re.IGNORECASE) else None
 
     year = None
+    model_year = None
     for i, ln in enumerate(lines):
-        if "الصنع" in ln:
+        if any(label in ln for label in ("الصنع", "الصلع")):
             for j in range(max(0, i - 1), min(i + 5, len(lines))):
-                m = re.search(r"\b0?\d{2,3}\b", lines[j])
+                m = re.search(r"\b\d{4}\b|\b0?\d{2,3}\b", lines_ascii[j])
                 if not m:
                     continue
                 try:
@@ -687,21 +863,64 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
             if year is not None:
                 break
 
+    spec_numbers = [value for value in all_numbers if value != _coerce_int(plate_number)]
+    spec_years = [value for value in spec_numbers if 1900 <= value <= 2100]
+    if spec_years:
+        model_year = spec_years[0]
+        if year is None:
+            year = spec_years[-1] if len(spec_years) > 1 else spec_years[0]
+
+    if engine_cc is None:
+        for value in spec_numbers:
+            if 200 <= value <= 10000 and not (1900 <= value <= 2100):
+                engine_cc = value
+                break
+
+    if empty_weight_kg is None or max_load_kg is None:
+        weight_candidates = [
+            value
+            for value in spec_numbers
+            if 100 <= value <= 100000 and value != engine_cc and value not in {model_year, year}
+        ]
+        if empty_weight_kg is None and weight_candidates:
+            empty_weight_kg = weight_candidates[0]
+        if max_load_kg is None:
+            if len(weight_candidates) >= 2:
+                max_load_kg = weight_candidates[1]
+            elif len(weight_candidates) == 1 and empty_weight_kg == weight_candidates[0]:
+                max_load_kg = weight_candidates[0]
+
+    if seats is None:
+        for value in spec_numbers:
+            if 1 <= value <= 80 and value != 2:
+                seats = value
+                break
+
     dates = find_date()
     issue_date = None
     expiry_date = None
     if dates:
-        expiry_date = dates[-1]
-        issue_date = dates[-2] if len(dates) >= 2 else None
+        dated = [(date_key(value), value) for value in dates]
+        dated = [(key, value) for key, value in dated if key is not None]
+        if len(dated) >= 2:
+            dated.sort(key=lambda item: item[0])
+            issue_date = dated[0][1]
+            expiry_date = dated[-1][1]
+        else:
+            expiry_date = dates[-1]
 
     return {
         "plate_number": plate_number,
+        "plate_text": plate_text,
         "vehicle_type": vehicle_type,
         "make": make,
         "model": model,
         "color": color,
         "year": year,
+        "model_year": model_year,
+        "country_of_origin": country_of_origin,
         "vin_or_chassis": vin_or_chassis,
+        "engine_number": engine_number,
         "engine_cc": engine_cc,
         "empty_weight_kg": empty_weight_kg,
         "max_load_kg": max_load_kg,
@@ -842,19 +1061,33 @@ def parse_args() -> argparse.Namespace:
         help="Translate extracted Arabic text to English (requires argostranslate + ar_en model)",
     )
     parser.add_argument(
+        "--fix_arabic_reverse",
+        action="store_true",
+        help=(
+            "Apply a legacy heuristic that reverses Arabic character runs. "
+            "Leave off for PaddleOCR Arabic models."
+        ),
+    )
+    parser.add_argument(
         "--no_fix_arabic_reverse",
         action="store_true",
         help=(
-            "Disable heuristic fix for reversed Arabic character runs in OCR output. "
-            "(By default enabled for --lang ar.)"
+            "Legacy no-op kept for compatibility; Arabic reverse fixing is off by default."
+        ),
+    )
+    parser.add_argument(
+        "--arabic_reshaper",
+        action="store_true",
+        help=(
+            "Apply arabic-reshaper to stored OCR text. Useful for display experiments, "
+            "but normally off so JSON contains logical Unicode text."
         ),
     )
     parser.add_argument(
         "--no_arabic_reshaper",
         action="store_true",
         help=(
-            "Disable arabic-reshaper post-processing (applied by default for --lang ar "
-            "immediately after OCR detection, before all downstream consumers)."
+            "Legacy no-op kept for compatibility; Arabic reshaping is off by default."
         ),
     )
     parser.add_argument(
@@ -957,9 +1190,8 @@ def main() -> None:
     args = parse_args()
 
     is_arabic = args.lang.lower() in {"ar", "arabic"}
-    fix_arabic_reverse = is_arabic and (not args.no_fix_arabic_reverse)
-    # reshape_arabic: ON by default for Arabic; opt out with --no_arabic_reshaper.
-    reshape_arabic = is_arabic and (not args.no_arabic_reshaper)
+    fix_arabic_reverse = is_arabic and args.fix_arabic_reverse and (not args.no_fix_arabic_reverse)
+    reshape_arabic = is_arabic and args.arabic_reshaper and (not args.no_arabic_reshaper)
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -972,18 +1204,7 @@ def main() -> None:
     import numpy as np
     from paddleocr import PaddleOCR
 
-    ocr = PaddleOCR(
-        use_angle_cls=args.use_angle_cls,
-        lang=args.lang,
-        use_gpu=args.use_gpu,
-        gpu_id=args.gpu_id,
-        enable_mkldnn=args.enable_mkldnn,
-        cpu_threads=args.cpu_threads,
-        rec_batch_num=args.rec_batch_num,
-        cls_batch_num=args.cls_batch_num,
-        det_limit_side_len=args.det_limit_side_len,
-        show_log=False,
-    )
+    ocr = PaddleOCR(**_build_paddleocr_kwargs(args, PaddleOCR))
 
     # ------------------------------------------------------------------
     # postprocess() — call this on every raw OCR text string right after
@@ -1139,7 +1360,11 @@ def main() -> None:
                             img = img[:, :, :3]
 
                         image_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                        result = ocr.ocr(image_bgr, cls=args.use_angle_cls)
+                        result = _run_paddle_ocr(
+                            ocr,
+                            image_bgr,
+                            use_angle_cls=args.use_angle_cls,
+                        )
                         raw_lines = _normalize_lines(result)
 
                         # ── POST-PROCESS every OCR line right after detection ──
@@ -1280,7 +1505,7 @@ def main() -> None:
     write_benchmark = args.write_benchmark
 
     t0 = time.perf_counter()
-    result = ocr.ocr(str(image_path), cls=args.use_angle_cls)
+    result = _run_paddle_ocr(ocr, str(image_path), use_angle_cls=args.use_angle_cls)
     raw_lines = _normalize_lines(result)
     if not raw_lines:
         print("No text detected.")
@@ -1355,6 +1580,55 @@ def main() -> None:
 
         data = _extract_mulkya_rulebased(ordered)
 
+        critical_fields = (
+            "plate_number",
+            "vin_or_chassis",
+            "engine_cc",
+            "empty_weight_kg",
+            "max_load_kg",
+            "seats",
+            "issue_date",
+            "year",
+        )
+        aux_ocr_lang = None
+        if is_arabic and any(data.get(field) in (None, "") for field in critical_fields):
+            try:
+                aux_args = argparse.Namespace(**vars(args))
+                aux_args.lang = "en"
+                aux_ocr = PaddleOCR(**_build_paddleocr_kwargs(aux_args, PaddleOCR))
+                aux_result = _run_paddle_ocr(aux_ocr, str(image_path), use_angle_cls=args.use_angle_cls)
+                aux_raw_lines = _normalize_lines(aux_result)
+                aux_lines = [
+                    (
+                        box,
+                        (
+                            _postprocess_ocr_line(
+                                text,
+                                lang="en",
+                                fix_arabic_reverse=False,
+                                reshape_arabic=False,
+                            ),
+                            conf,
+                        ),
+                    )
+                    for box, (text, conf) in aux_raw_lines
+                ]
+                aux_ordered: list[str] = []
+                aux_min_conf = max(args.min_conf, 0.70)
+                for _box, (text, confidence) in _sort_lines(aux_lines, rtl=False):
+                    if float(confidence) >= aux_min_conf:
+                        nt = _normalize_for_translation(text)
+                        if nt:
+                            aux_ordered.append(nt)
+                if aux_ordered:
+                    data = _extract_mulkya_rulebased(ordered + aux_ordered)
+                    data["notes"] = "Heuristic extraction with auxiliary English OCR fallback."
+                    aux_ocr_lang = "en"
+            except Exception as exc:
+                data.setdefault("validation_notes", [])
+                if isinstance(data["validation_notes"], list):
+                    data["validation_notes"].append(f"auxiliary_ocr_failed: {exc}")
+
         # Validate extracted data and add any inconsistency notes.
         _validate_and_note_data(data)
 
@@ -1364,6 +1638,7 @@ def main() -> None:
                 {
                     "input": str(image_path),
                     "lang": args.lang,
+                    "auxiliary_ocr_lang": aux_ocr_lang,
                     "fix_arabic_reverse": fix_arabic_reverse,
                     "reshape_arabic": reshape_arabic,
                 }

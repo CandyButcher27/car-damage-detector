@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import statistics
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +29,55 @@ DEFAULT_SAMPLE_FILES = {
     "left": ROOT_DIR / "Samples" / "car_10.jpg",
     "right": ROOT_DIR / "Samples" / "car_10.jpg",
 }
+CONVERTED_SAMPLE_DIR = ROOT_DIR / "Samples" / "converted"
+SAMPLE_FORMATS = ("original", "png", "webp", "bmp", "tiff", "pdf")
+CONVERTED_SAMPLE_FILES = {
+    "png": {
+        "car": CONVERTED_SAMPLE_DIR / "car_10.png",
+        "mulkiya": CONVERTED_SAMPLE_DIR / "Mulkiya_front.png",
+        "pdf": CONVERTED_SAMPLE_DIR / "Mulkiya_front.png",
+        "front": CONVERTED_SAMPLE_DIR / "car_1001.png",
+        "back": CONVERTED_SAMPLE_DIR / "car_1003.png",
+        "left": CONVERTED_SAMPLE_DIR / "car_1005.png",
+        "right": CONVERTED_SAMPLE_DIR / "car_1007.png",
+    },
+    "webp": {
+        "car": CONVERTED_SAMPLE_DIR / "car_10.webp",
+        "mulkiya": CONVERTED_SAMPLE_DIR / "Mulkiya_front.webp",
+        "pdf": CONVERTED_SAMPLE_DIR / "Mulkiya_front.webp",
+        "front": CONVERTED_SAMPLE_DIR / "car_1001.webp",
+        "back": CONVERTED_SAMPLE_DIR / "car_1003.webp",
+        "left": CONVERTED_SAMPLE_DIR / "car_1005.webp",
+        "right": CONVERTED_SAMPLE_DIR / "car_1007.webp",
+    },
+    "bmp": {
+        "car": CONVERTED_SAMPLE_DIR / "car_10.bmp",
+        "mulkiya": CONVERTED_SAMPLE_DIR / "Mulkiya_front.bmp",
+        "pdf": CONVERTED_SAMPLE_DIR / "Mulkiya_front.bmp",
+        "front": CONVERTED_SAMPLE_DIR / "car_1001.bmp",
+        "back": CONVERTED_SAMPLE_DIR / "car_1003.bmp",
+        "left": CONVERTED_SAMPLE_DIR / "car_1005.bmp",
+        "right": CONVERTED_SAMPLE_DIR / "car_1007.bmp",
+    },
+    "tiff": {
+        "car": CONVERTED_SAMPLE_DIR / "car_10.tiff",
+        "mulkiya": CONVERTED_SAMPLE_DIR / "Mulkiya_front.tiff",
+        "pdf": CONVERTED_SAMPLE_DIR / "Mulkiya_front.tiff",
+        "front": CONVERTED_SAMPLE_DIR / "car_1001.tiff",
+        "back": CONVERTED_SAMPLE_DIR / "car_1003.tiff",
+        "left": CONVERTED_SAMPLE_DIR / "car_1005.tiff",
+        "right": CONVERTED_SAMPLE_DIR / "car_1007.tiff",
+    },
+    "pdf": {
+        "car": CONVERTED_SAMPLE_DIR / "car_10.pdf",
+        "mulkiya": CONVERTED_SAMPLE_DIR / "Mulkiya_front.pdf",
+        "pdf": CONVERTED_SAMPLE_DIR / "Mulkiya_front.pdf",
+        "front": CONVERTED_SAMPLE_DIR / "car_1001.pdf",
+        "back": CONVERTED_SAMPLE_DIR / "car_1003.pdf",
+        "left": CONVERTED_SAMPLE_DIR / "car_1005.pdf",
+        "right": CONVERTED_SAMPLE_DIR / "car_1007.pdf",
+    },
+}
 
 
 @dataclass(slots=True)
@@ -39,6 +90,8 @@ class LatencySample:
     server_ms: float | None
     ok: bool
     error: str | None = None
+    upload_files: dict[str, str] | None = None
+    sample_formats: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -57,6 +110,25 @@ class Scenario:
     title: str
     make_request: Any
     request_form: dict[str, Any] | None = None
+
+
+class SamplePicker:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.rng = random.Random(args.random_seed)
+        self.lock = threading.Lock()
+
+    def pick(self, key: str, override: Path | None) -> tuple[Path, str]:
+        if override is not None:
+            return _ensure_file(override), "override"
+
+        if self.args.random_sample_format:
+            with self.lock:
+                sample_format = self.rng.choice(SAMPLE_FORMATS)
+        else:
+            sample_format = self.args.sample_format
+
+        return _ensure_file(_preset_sample_for_format(sample_format, key)), sample_format
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -101,22 +173,45 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--sample-format",
+        choices=SAMPLE_FORMATS,
+        default="original",
+        help=(
+            "Use prepared samples in this format for process-car, process-mulkiya, "
+            "process-pdf, predict-car, and predict-damage. Explicit file flags override this."
+        ),
+    )
+    parser.add_argument(
+        "--random-sample-format",
+        action="store_true",
+        help=(
+            "Choose a random prepared sample format for every upload request. "
+            "Explicit file flags still override random selection for that field."
+        ),
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Optional seed for repeatable --random-sample-format runs.",
+    )
+    parser.add_argument(
         "--car-file",
         type=Path,
-        default=DEFAULT_SAMPLE_FILES["car"],
+        default=None,
         help="Image file used for process_type=car and /predict/ benchmarks.",
     )
     parser.add_argument(
         "--mulkiya-file",
         type=Path,
-        default=DEFAULT_SAMPLE_FILES["card"],
+        default=None,
         help="Image or PDF file used for process_type=mulkiya benchmarks.",
     )
     parser.add_argument(
         "--pdf-file",
         type=Path,
-        default=DEFAULT_SAMPLE_FILES["document"],
-        help="PDF file used for process_type=pdf benchmarks.",
+        default=None,
+        help="File used for process_type=pdf benchmarks. Images are accepted to test API image-to-PDF conversion.",
     )
     parser.add_argument(
         "--card-threshold",
@@ -141,13 +236,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-json", default=None, help="Optional path to write the raw benchmark results as JSON.")
     parser.add_argument("--skip-standalone", action="store_true", help="Skip benchmarking the standalone car API.")
-    parser.add_argument("--front-file", type=Path, default=DEFAULT_SAMPLE_FILES["front"],
+    parser.add_argument("--front-file", type=Path, default=None,
                         help="Front view image for /predict/damage benchmark.")
-    parser.add_argument("--back-file",  type=Path, default=DEFAULT_SAMPLE_FILES["back"],
+    parser.add_argument("--back-file",  type=Path, default=None,
                         help="Back view image for /predict/damage benchmark.")
-    parser.add_argument("--left-file",  type=Path, default=DEFAULT_SAMPLE_FILES["left"],
+    parser.add_argument("--left-file",  type=Path, default=None,
                         help="Left view image for /predict/damage benchmark.")
-    parser.add_argument("--right-file", type=Path, default=DEFAULT_SAMPLE_FILES["right"],
+    parser.add_argument("--right-file", type=Path, default=None,
                         help="Right view image for /predict/damage benchmark.")
     return parser
 
@@ -156,6 +251,13 @@ def _ensure_file(path: Path) -> Path:
     if not path.exists():
         raise FileNotFoundError(f"Sample file not found: {path}")
     return path
+
+
+def _preset_sample_for_format(sample_format: str, key: str) -> Path:
+    if sample_format == "original":
+        original_key = "card" if key == "mulkiya" else "document" if key == "pdf" else key
+        return DEFAULT_SAMPLE_FILES[original_key]
+    return CONVERTED_SAMPLE_FILES[sample_format][key]
 
 
 def _normalize_base_url(url: str) -> str:
@@ -278,7 +380,13 @@ def _build_multipart_damage_body(view_files: dict[str, Path]) -> tuple[bytes, st
     return b"".join(chunks), boundary
 
 
-def _send_damage_post(url: str, timeout: float, name: str, view_files: dict[str, Path]) -> LatencySample:
+def _send_damage_post(
+    url: str,
+    timeout: float,
+    name: str,
+    view_files: dict[str, Path],
+    sample_formats: dict[str, str] | None = None,
+) -> LatencySample:
     started_at = time.perf_counter()
     try:
         body, boundary = _build_multipart_damage_body(view_files)
@@ -297,6 +405,8 @@ def _send_damage_post(url: str, timeout: float, name: str, view_files: dict[str,
             elapsed_ms=_request_elapsed_ms(started_at),
             server_ms=_parse_server_ms(response),
             ok=response.ok,
+            upload_files={key: str(path) for key, path in view_files.items()},
+            sample_formats=sample_formats,
         )
     except (OSError, URLError, ValueError) as exc:
         return LatencySample(
@@ -308,6 +418,8 @@ def _send_damage_post(url: str, timeout: float, name: str, view_files: dict[str,
             server_ms=None,
             ok=False,
             error=str(exc),
+            upload_files={key: str(path) for key, path in view_files.items()},
+            sample_formats=sample_formats,
         )
 
 
@@ -317,6 +429,7 @@ def _send_multipart_post(
     name: str,
     file_path: Path,
     extra_data: dict[str, Any] | None = None,
+    sample_format: str | None = None,
 ) -> LatencySample:
     started_at = time.perf_counter()
     form_data = {key: str(value) for key, value in (extra_data or {}).items()}
@@ -337,6 +450,8 @@ def _send_multipart_post(
             elapsed_ms=_request_elapsed_ms(started_at),
             server_ms=_parse_server_ms(response),
             ok=response.ok,
+            upload_files={"file": str(file_path)},
+            sample_formats={"file": sample_format} if sample_format else None,
         )
     except (OSError, URLError, ValueError) as exc:
         return LatencySample(
@@ -348,6 +463,8 @@ def _send_multipart_post(
             server_ms=None,
             ok=False,
             error=str(exc),
+            upload_files={"file": str(file_path)},
+            sample_formats={"file": sample_format} if sample_format else None,
         )
 
 
@@ -361,6 +478,10 @@ def _guess_mime_type(path: Path) -> str:
         return "image/png"
     if suffix == ".webp":
         return "image/webp"
+    if suffix == ".bmp":
+        return "image/bmp"
+    if suffix in {".tif", ".tiff"}:
+        return "image/tiff"
     return "application/octet-stream"
 
 
@@ -398,6 +519,13 @@ def _summarize(name: str, samples: list[LatencySample]) -> dict[str, Any]:
     elapsed = [sample.elapsed_ms for sample in samples]
     server = [sample.server_ms for sample in samples if sample.server_ms is not None]
     success = [sample for sample in samples if sample.ok]
+    format_counts: dict[str, int] = {}
+    upload_examples: dict[str, str] = {}
+    for sample in samples:
+        for sample_format in (sample.sample_formats or {}).values():
+            format_counts[sample_format] = format_counts.get(sample_format, 0) + 1
+        for field_name, upload_path in (sample.upload_files or {}).items():
+            upload_examples.setdefault(field_name, upload_path)
 
     return {
         "name": name,
@@ -420,6 +548,8 @@ def _summarize(name: str, samples: list[LatencySample]) -> dict[str, Any]:
             "max": round(max(server), 2) if server else None,
         },
         "errors": [sample.error for sample in samples if sample.error],
+        "sample_format_counts": format_counts,
+        "upload_examples": upload_examples,
     }
 
 
@@ -440,6 +570,8 @@ def _print_summary(summary: dict[str, Any]) -> None:
         )
     if summary["errors"]:
         print(f"  Errors: {summary['errors']}")
+    if summary["sample_format_counts"]:
+        print(f"  Sample formats: {summary['sample_format_counts']}")
 
 
 def _selected_scenarios(args: argparse.Namespace) -> set[str]:
@@ -457,18 +589,23 @@ def _selected_scenarios(args: argparse.Namespace) -> set[str]:
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
+    picker = SamplePicker(args)
 
-    sample_files = {
-        "car": _ensure_file(args.car_file),
-        "mulkiya": _ensure_file(args.mulkiya_file),
-        "pdf": _ensure_file(args.pdf_file),
-    }
-    damage_view_files = {
-        "front": _ensure_file(args.front_file),
-        "back":  _ensure_file(args.back_file),
-        "left":  _ensure_file(args.left_file),
-        "right": _ensure_file(args.right_file),
-    }
+    def pick_upload(key: str, override: Path | None = None) -> tuple[Path, str]:
+        return picker.pick(key, override)
+
+    def pick_damage_views() -> tuple[dict[str, Path], dict[str, str]]:
+        selected = {
+            "front": pick_upload("front", args.front_file),
+            "back": pick_upload("back", args.back_file),
+            "left": pick_upload("left", args.left_file),
+            "right": pick_upload("right", args.right_file),
+        }
+        return (
+            {field_name: item[0] for field_name, item in selected.items()},
+            {field_name: item[1] for field_name, item in selected.items()},
+        )
+
     results: list[dict[str, Any]] = []
 
     print("Benchmarking unified API...")
@@ -502,57 +639,72 @@ def main() -> int:
         Scenario(
             "predict-car",
             "Unified POST /predict/ (car)",
-            lambda: _send_multipart_post(
-                f"{unified_base}/predict/",
-                args.timeout,
-                "Unified POST /predict/ (car)",
-                sample_files["car"],
-            ),
+            lambda: (
+                lambda chosen: _send_multipart_post(
+                    f"{unified_base}/predict/",
+                    args.timeout,
+                    "Unified POST /predict/ (car)",
+                    chosen[0],
+                    sample_format=chosen[1],
+                )
+            )(pick_upload("car", args.car_file)),
         ),
         Scenario(
             "predict-damage",
             "Unified POST /predict/damage (4 views)",
-            lambda: _send_damage_post(
-                f"{unified_base}/predict/damage",
-                args.timeout,
-                "Unified POST /predict/damage (4 views)",
-                damage_view_files,
-            ),
+            lambda: (
+                lambda chosen: _send_damage_post(
+                    f"{unified_base}/predict/damage",
+                    args.timeout,
+                    "Unified POST /predict/damage (4 views)",
+                    chosen[0],
+                    chosen[1],
+                )
+            )(pick_damage_views()),
         ),
         Scenario(
             "process-car",
             "Unified POST /api/v1/process (process_type=car)",
-            lambda: _send_multipart_post(
-                f"{unified_base}/api/v1/process",
-                args.timeout,
-                "Unified POST /api/v1/process (process_type=car)",
-                sample_files["car"],
-                process_car_form,
-            ),
+            lambda: (
+                lambda chosen: _send_multipart_post(
+                    f"{unified_base}/api/v1/process",
+                    args.timeout,
+                    "Unified POST /api/v1/process (process_type=car)",
+                    chosen[0],
+                    process_car_form,
+                    sample_format=chosen[1],
+                )
+            )(pick_upload("car", args.car_file)),
             process_car_form,
         ),
         Scenario(
             "process-mulkiya",
             "Unified POST /api/v1/process (process_type=mulkiya)",
-            lambda: _send_multipart_post(
-                f"{unified_base}/api/v1/process",
-                args.timeout,
-                "Unified POST /api/v1/process (process_type=mulkiya)",
-                sample_files["mulkiya"],
-                process_mulkiya_form,
-            ),
+            lambda: (
+                lambda chosen: _send_multipart_post(
+                    f"{unified_base}/api/v1/process",
+                    args.timeout,
+                    "Unified POST /api/v1/process (process_type=mulkiya)",
+                    chosen[0],
+                    process_mulkiya_form,
+                    sample_format=chosen[1],
+                )
+            )(pick_upload("mulkiya", args.mulkiya_file)),
             process_mulkiya_form,
         ),
         Scenario(
             "process-pdf",
             "Unified POST /api/v1/process (process_type=pdf)",
-            lambda: _send_multipart_post(
-                f"{unified_base}/api/v1/process",
-                args.timeout,
-                "Unified POST /api/v1/process (process_type=pdf)",
-                sample_files["pdf"],
-                process_pdf_form,
-            ),
+            lambda: (
+                lambda chosen: _send_multipart_post(
+                    f"{unified_base}/api/v1/process",
+                    args.timeout,
+                    "Unified POST /api/v1/process (process_type=pdf)",
+                    chosen[0],
+                    process_pdf_form,
+                    sample_format=chosen[1],
+                )
+            )(pick_upload("pdf", args.pdf_file)),
             process_pdf_form,
         ),
     ]
@@ -569,12 +721,15 @@ def main() -> int:
                 Scenario(
                     "standalone-car",
                     "Standalone POST /predict/ (car)",
-                    lambda: _send_multipart_post(
-                        f"{standalone_base}/predict/",
-                        args.timeout,
-                        "Standalone POST /predict/ (car)",
-                        sample_files["car"],
-                    ),
+                    lambda: (
+                        lambda chosen: _send_multipart_post(
+                            f"{standalone_base}/predict/",
+                            args.timeout,
+                            "Standalone POST /predict/ (car)",
+                            chosen[0],
+                            sample_format=chosen[1],
+                        )
+                    )(pick_upload("car", args.car_file)),
                 ),
             ]
         )
@@ -597,7 +752,18 @@ def main() -> int:
         "runs": args.runs,
         "concurrency": args.concurrency,
         "scenarios": sorted(selected),
-        "sample_files": {key: str(path) for key, path in sample_files.items()},
+        "sample_format": args.sample_format,
+        "random_sample_format": args.random_sample_format,
+        "random_seed": args.random_seed,
+        "explicit_file_overrides": {
+            "car": str(args.car_file) if args.car_file else None,
+            "mulkiya": str(args.mulkiya_file) if args.mulkiya_file else None,
+            "pdf": str(args.pdf_file) if args.pdf_file else None,
+            "front": str(args.front_file) if args.front_file else None,
+            "back": str(args.back_file) if args.back_file else None,
+            "left": str(args.left_file) if args.left_file else None,
+            "right": str(args.right_file) if args.right_file else None,
+        },
         "card_threshold": args.card_threshold,
         "prefer_pdf_text": args.prefer_pdf_text,
         "ocr_lang": args.ocr_lang,

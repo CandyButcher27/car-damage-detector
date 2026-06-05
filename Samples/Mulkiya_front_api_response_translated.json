@@ -1,0 +1,586 @@
+{
+  "input": {
+    "filename": "Mulkiya_front.jpg",
+    "kind": "image",
+    "normalized": {
+      "kind": "image",
+      "mime_type": "image/png",
+      "converted": true,
+      "details": {
+        "source_kind": "image",
+        "target_kind": "image",
+        "target_suffix": ".png",
+        "target_mime_type": "image/png",
+        "original_format": "JPEG",
+        "original_mode": "RGB",
+        "original_size": [
+          1080,
+          702
+        ],
+        "converted": true
+      }
+    }
+  },
+  "classification": {
+    "label": "card",
+    "probability": 0.9993433356285095,
+    "threshold": 0.5
+  },
+  "car_classification": null,
+  "confidence_score": 0.9993433356285095,
+  "extracted_data": {
+    "plate_number": null,
+    "plate_text": "بب",
+    "vehicle_type": "خصوصي",
+    "make": "تويوتا",
+    "model": "كورولا",
+    "color": "ابيض",
+    "year": null,
+    "vin_or_chassis": null,
+    "engine_cc": null,
+    "empty_weight_kg": null,
+    "max_load_kg": null,
+    "seats": null,
+    "issue_date": null,
+    "expiry_date": "2025/05/06",
+    "owner_name": null,
+    "notes": "Heuristic extraction.",
+    "source": {
+      "input": "C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-ompijkbj\\Mulkiya_front_normalized.png",
+      "lang": "ar",
+      "fix_arabic_reverse": false,
+      "reshape_arabic": false
+    }
+  },
+  "raw_ocr": {
+    "image": "C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-ompijkbj\\Mulkiya_front_normalized.png",
+    "lines": [
+      {
+        "text": "سلطنة",
+        "confidence": 0.9914679527282715
+      },
+      {
+        "text": "عمان",
+        "confidence": 0.9319682121276855
+      },
+      {
+        "text": "SULTANATE OF OMAN",
+        "confidence": 0.9766718745231628
+      },
+      {
+        "text": "شرطة",
+        "confidence": 0.9967973232269287
+      },
+      {
+        "text": "عمان",
+        "confidence": 0.9613292217254639
+      },
+      {
+        "text": "السلطائية",
+        "confidence": 0.9610370993614197
+      },
+      {
+        "text": "ROYAL OMAN POLICE",
+        "confidence": 0.9800220727920532
+      },
+      {
+        "text": "الادارة",
+        "confidence": 0.896859347820282
+      },
+      {
+        "text": "العامة",
+        "confidence": 0.915788471698761
+      },
+      {
+        "text": "للمرور",
+        "confidence": 0.9406237006187439
+      },
+      {
+        "text": "DIR. GENERALOFTRAFFIC",
+        "confidence": 0.9794876575469971
+      },
+      {
+        "text": "رخصة",
+        "confidence": 0.9969320297241211
+      },
+      {
+        "text": "مركبة",
+        "confidence": 0.9198094606399536
+      },
+      {
+        "text": "MOTOR VEHICLE LICENSE",
+        "confidence": 0.9984557032585144
+      },
+      {
+        "text": "رقم",
+        "confidence": 0.9659178853034973
+      },
+      {
+        "text": "اللوحة",
+        "confidence": 0.9132182598114014
+      },
+      {
+        "text": ":",
+        "confidence": 0.7975698113441467
+      },
+      {
+        "text": "بب",
+        "confidence": 0.864041805267334
+      },
+      {
+        "text": "نوع الوحة  خصوصي",
+        "confidence": 0.7788952589035034
+      },
+      {
+        "text": "نوع المركبة",
+        "confidence": 0.9373869299888611
+      },
+      {
+        "text": "تويوتا صالون كورولا",
+        "confidence": 0.9648950695991516
+      },
+      {
+        "text": "اللون",
+        "confidence": 0.9435396194458008
+      },
+      {
+        "text": "ابيض",
+        "confidence": 0.7769114375114441
+      },
+      {
+        "text": "المنشاء",
+        "confidence": 0.9950881600379944
+      },
+      {
+        "text": "الولايات",
+        "confidence": 0.9383055567741394
+      },
+      {
+        "text": "المتحدة الامريكية",
+        "confidence": 0.9826736450195312
+      },
+      {
+        "text": "سنة الطرار",
+        "confidence": 0.9109429121017456
+      },
+      {
+        "text": "سعة المحرك",
+        "confidence": 0.9689041376113892
+      },
+      {
+        "text": "الوزن فارغكجمالحمولة القصوى",
+        "confidence": 0.920826256275177
+      },
+      {
+        "text": "سنة الصلع",
+        "confidence": 0.8583561778068542
+      },
+      {
+        "text": "عدد الركاب ",
+        "confidence": 0.8189184069633484
+      },
+      {
+        "text": "عدد المحاور 2",
+        "confidence": 0.8862879276275635
+      },
+      {
+        "text": "كجم",
+        "confidence": 0.9424352645874023
+      },
+      {
+        "text": "رقم الاعدةالشاص",
+        "confidence": 0.7564228177070618
+      },
+      {
+        "text": "NIL: رقم المحرة",
+        "confidence": 0.8957913517951965
+      },
+      {
+        "text": "صلاحية",
+        "confidence": 0.9669051766395569
+      },
+      {
+        "text": "الرخصة من",
+        "confidence": 0.8941123485565186
+      },
+      {
+        "text": "2025/05/06",
+        "confidence": 0.9994338750839233
+      }
+    ]
+  },
+  "rag_chunks": [
+    {
+      "source_file": "Mulkiya_front.jpg",
+      "document_type": "structured_json",
+      "chunk_id": "chunk-1",
+      "text": "plate_number: \nplate_text: بب\nvehicle_type: خصوصي\nmake: تويوتا\nmodel: كورولا\ncolor: ابيض\nyear: \nvin_or_chassis: \nengine_cc: \nempty_weight_kg: \nmax_load_kg: \nseats: \nissue_date: \nexpiry_date: 2025/05/06\nowner_name: \nnotes: Heuristic extraction.\nsource.input: C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-ompijkbj\\Mulkiya_front_normalized.png\nsource.lang: ar\nsource.fix_arabic_reverse: False\nsource.reshape_arabic: False",
+      "metadata": {
+        "chunk_index": 1,
+        "source_type": "structured_json"
+      }
+    }
+  ],
+  "artifacts": {
+    "chunk_source": "C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-ompijkbj\\Mulkiya_front_normalized_mulkya.json"
+  },
+  "note": "Mulkiya pipeline executed with card inference and OCR extraction.",
+  "translation": {
+    "target_language": "en",
+    "provider": "local_dictionary",
+    "note": "Local helper translation for Mulkiya review. It translates known OCR labels and common values, and leaves unknown text unchanged.",
+    "extracted_data": {
+      "plate_number": {
+        "label": "Plate number",
+        "value": null,
+        "translation": null
+      },
+      "plate_text": {
+        "label": "Plate letters",
+        "value": "بب",
+        "translation": "Ba Ba (Arabic plate letters)"
+      },
+      "vehicle_type": {
+        "label": "Vehicle type",
+        "value": "خصوصي",
+        "translation": "Private"
+      },
+      "make": {
+        "label": "Make",
+        "value": "تويوتا",
+        "translation": "Toyota"
+      },
+      "model": {
+        "label": "Model",
+        "value": "كورولا",
+        "translation": "Corolla"
+      },
+      "color": {
+        "label": "Color",
+        "value": "ابيض",
+        "translation": "White"
+      },
+      "year": {
+        "label": "Model year",
+        "value": null,
+        "translation": null
+      },
+      "vin_or_chassis": {
+        "label": "VIN or chassis number",
+        "value": null,
+        "translation": null
+      },
+      "engine_cc": {
+        "label": "Engine capacity (cc)",
+        "value": null,
+        "translation": null
+      },
+      "empty_weight_kg": {
+        "label": "Empty weight (kg)",
+        "value": null,
+        "translation": null
+      },
+      "max_load_kg": {
+        "label": "Maximum load (kg)",
+        "value": null,
+        "translation": null
+      },
+      "seats": {
+        "label": "Seats",
+        "value": null,
+        "translation": null
+      },
+      "issue_date": {
+        "label": "Issue date",
+        "value": null,
+        "translation": null
+      },
+      "expiry_date": {
+        "label": "Expiry date",
+        "value": "2025/05/06",
+        "translation": "2025/05/06"
+      },
+      "owner_name": {
+        "label": "Owner name",
+        "value": null,
+        "translation": null
+      },
+      "notes": {
+        "label": "Notes",
+        "value": "Heuristic extraction.",
+        "translation": "Heuristic extraction."
+      }
+    },
+    "raw_ocr": {
+      "line_count": 38,
+      "lines": [
+        {
+          "page": 1,
+          "line_index": 1,
+          "text": "سلطنة",
+          "translation": "Sultanate",
+          "confidence": 0.9914679527282715
+        },
+        {
+          "page": 1,
+          "line_index": 2,
+          "text": "عمان",
+          "translation": "Oman",
+          "confidence": 0.9319682121276855
+        },
+        {
+          "page": 1,
+          "line_index": 3,
+          "text": "SULTANATE OF OMAN",
+          "translation": "SULTANATE OF OMAN",
+          "confidence": 0.9766718745231628
+        },
+        {
+          "page": 1,
+          "line_index": 4,
+          "text": "شرطة",
+          "translation": "Police",
+          "confidence": 0.9967973232269287
+        },
+        {
+          "page": 1,
+          "line_index": 5,
+          "text": "عمان",
+          "translation": "Oman",
+          "confidence": 0.9613292217254639
+        },
+        {
+          "page": 1,
+          "line_index": 6,
+          "text": "السلطائية",
+          "translation": "Royal",
+          "confidence": 0.9610370993614197
+        },
+        {
+          "page": 1,
+          "line_index": 7,
+          "text": "ROYAL OMAN POLICE",
+          "translation": "ROYAL OMAN POLICE",
+          "confidence": 0.9800220727920532
+        },
+        {
+          "page": 1,
+          "line_index": 8,
+          "text": "الادارة",
+          "translation": "Directorate",
+          "confidence": 0.896859347820282
+        },
+        {
+          "page": 1,
+          "line_index": 9,
+          "text": "العامة",
+          "translation": "General",
+          "confidence": 0.915788471698761
+        },
+        {
+          "page": 1,
+          "line_index": 10,
+          "text": "للمرور",
+          "translation": "Traffic",
+          "confidence": 0.9406237006187439
+        },
+        {
+          "page": 1,
+          "line_index": 11,
+          "text": "DIR. GENERALOFTRAFFIC",
+          "translation": "DIR. GENERALOFTRAFFIC",
+          "confidence": 0.9794876575469971
+        },
+        {
+          "page": 1,
+          "line_index": 12,
+          "text": "رخصة",
+          "translation": "License",
+          "confidence": 0.9969320297241211
+        },
+        {
+          "page": 1,
+          "line_index": 13,
+          "text": "مركبة",
+          "translation": "Vehicle",
+          "confidence": 0.9198094606399536
+        },
+        {
+          "page": 1,
+          "line_index": 14,
+          "text": "MOTOR VEHICLE LICENSE",
+          "translation": "MOTOR VEHICLE LICENSE",
+          "confidence": 0.9984557032585144
+        },
+        {
+          "page": 1,
+          "line_index": 15,
+          "text": "رقم",
+          "translation": "Number",
+          "confidence": 0.9659178853034973
+        },
+        {
+          "page": 1,
+          "line_index": 16,
+          "text": "اللوحة",
+          "translation": "Plate",
+          "confidence": 0.9132182598114014
+        },
+        {
+          "page": 1,
+          "line_index": 17,
+          "text": ":",
+          "translation": ":",
+          "confidence": 0.7975698113441467
+        },
+        {
+          "page": 1,
+          "line_index": 18,
+          "text": "بب",
+          "translation": "Ba Ba (Arabic plate letters)",
+          "confidence": 0.864041805267334
+        },
+        {
+          "page": 1,
+          "line_index": 19,
+          "text": "نوع الوحة  خصوصي",
+          "translation": "Plate type Private",
+          "confidence": 0.7788952589035034
+        },
+        {
+          "page": 1,
+          "line_index": 20,
+          "text": "نوع المركبة",
+          "translation": "Vehicle type",
+          "confidence": 0.9373869299888611
+        },
+        {
+          "page": 1,
+          "line_index": 21,
+          "text": "تويوتا صالون كورولا",
+          "translation": "Toyota Corolla sedan",
+          "confidence": 0.9648950695991516
+        },
+        {
+          "page": 1,
+          "line_index": 22,
+          "text": "اللون",
+          "translation": "Color",
+          "confidence": 0.9435396194458008
+        },
+        {
+          "page": 1,
+          "line_index": 23,
+          "text": "ابيض",
+          "translation": "White",
+          "confidence": 0.7769114375114441
+        },
+        {
+          "page": 1,
+          "line_index": 24,
+          "text": "المنشاء",
+          "translation": "Origin",
+          "confidence": 0.9950881600379944
+        },
+        {
+          "page": 1,
+          "line_index": 25,
+          "text": "الولايات",
+          "translation": "United States",
+          "confidence": 0.9383055567741394
+        },
+        {
+          "page": 1,
+          "line_index": 26,
+          "text": "المتحدة الامريكية",
+          "translation": "United States of America",
+          "confidence": 0.9826736450195312
+        },
+        {
+          "page": 1,
+          "line_index": 27,
+          "text": "سنة الطرار",
+          "translation": "Model year",
+          "confidence": 0.9109429121017456
+        },
+        {
+          "page": 1,
+          "line_index": 28,
+          "text": "سعة المحرك",
+          "translation": "Engine capacity",
+          "confidence": 0.9689041376113892
+        },
+        {
+          "page": 1,
+          "line_index": 29,
+          "text": "الوزن فارغكجمالحمولة القصوى",
+          "translation": "Weight EmptykgLoad Maximum",
+          "confidence": 0.920826256275177
+        },
+        {
+          "page": 1,
+          "line_index": 30,
+          "text": "سنة الصلع",
+          "translation": "Manufacture year",
+          "confidence": 0.8583561778068542
+        },
+        {
+          "page": 1,
+          "line_index": 31,
+          "text": "عدد الركاب ",
+          "translation": "Number of passengers",
+          "confidence": 0.8189184069633484
+        },
+        {
+          "page": 1,
+          "line_index": 32,
+          "text": "عدد المحاور 2",
+          "translation": "Number of axles 2",
+          "confidence": 0.8862879276275635
+        },
+        {
+          "page": 1,
+          "line_index": 33,
+          "text": "كجم",
+          "translation": "kg",
+          "confidence": 0.9424352645874023
+        },
+        {
+          "page": 1,
+          "line_index": 34,
+          "text": "رقم الاعدةالشاص",
+          "translation": "Chassis number",
+          "confidence": 0.7564228177070618
+        },
+        {
+          "page": 1,
+          "line_index": 35,
+          "text": "NIL: رقم المحرة",
+          "translation": "NIL: Engine number",
+          "confidence": 0.8957913517951965
+        },
+        {
+          "page": 1,
+          "line_index": 36,
+          "text": "صلاحية",
+          "translation": "Validity",
+          "confidence": 0.9669051766395569
+        },
+        {
+          "page": 1,
+          "line_index": 37,
+          "text": "الرخصة من",
+          "translation": "License from",
+          "confidence": 0.8941123485565186
+        },
+        {
+          "page": 1,
+          "line_index": 38,
+          "text": "2025/05/06",
+          "translation": "2025/05/06",
+          "confidence": 0.9994338750839233
+        }
+      ]
+    }
+  }
+}

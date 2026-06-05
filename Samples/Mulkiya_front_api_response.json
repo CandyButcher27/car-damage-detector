@@ -1,0 +1,228 @@
+{
+  "input": {
+    "filename": "Mulkiya_front.jpg",
+    "kind": "image",
+    "normalized": {
+      "kind": "image",
+      "mime_type": "image/png",
+      "converted": true,
+      "details": {
+        "source_kind": "image",
+        "target_kind": "image",
+        "target_suffix": ".png",
+        "target_mime_type": "image/png",
+        "original_format": "JPEG",
+        "original_mode": "RGB",
+        "original_size": [
+          1080,
+          702
+        ],
+        "converted": true
+      }
+    }
+  },
+  "classification": {
+    "label": "card",
+    "probability": 0.9993433356285095,
+    "threshold": 0.5
+  },
+  "car_classification": null,
+  "confidence_score": 0.9993433356285095,
+  "extracted_data": {
+    "plate_number": null,
+    "plate_text": "بب",
+    "vehicle_type": "خصوصي",
+    "make": "تويوتا",
+    "model": "كورولا",
+    "color": "ابيض",
+    "year": null,
+    "vin_or_chassis": null,
+    "engine_cc": null,
+    "empty_weight_kg": null,
+    "max_load_kg": null,
+    "seats": null,
+    "issue_date": null,
+    "expiry_date": "2025/05/06",
+    "owner_name": null,
+    "notes": "Heuristic extraction.",
+    "source": {
+      "input": "C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-iekh3kc1\\Mulkiya_front_normalized.png",
+      "lang": "ar",
+      "fix_arabic_reverse": false,
+      "reshape_arabic": false
+    }
+  },
+  "raw_ocr": {
+    "image": "C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-iekh3kc1\\Mulkiya_front_normalized.png",
+    "lines": [
+      {
+        "text": "سلطنة",
+        "confidence": 0.9914679527282715
+      },
+      {
+        "text": "عمان",
+        "confidence": 0.9319682121276855
+      },
+      {
+        "text": "SULTANATE OF OMAN",
+        "confidence": 0.9766718745231628
+      },
+      {
+        "text": "شرطة",
+        "confidence": 0.9967973232269287
+      },
+      {
+        "text": "عمان",
+        "confidence": 0.9613292217254639
+      },
+      {
+        "text": "السلطائية",
+        "confidence": 0.9610370993614197
+      },
+      {
+        "text": "ROYAL OMAN POLICE",
+        "confidence": 0.9800220727920532
+      },
+      {
+        "text": "الادارة",
+        "confidence": 0.896859347820282
+      },
+      {
+        "text": "العامة",
+        "confidence": 0.915788471698761
+      },
+      {
+        "text": "للمرور",
+        "confidence": 0.9406237006187439
+      },
+      {
+        "text": "DIR. GENERALOFTRAFFIC",
+        "confidence": 0.9794876575469971
+      },
+      {
+        "text": "رخصة",
+        "confidence": 0.9969320297241211
+      },
+      {
+        "text": "مركبة",
+        "confidence": 0.9198094606399536
+      },
+      {
+        "text": "MOTOR VEHICLE LICENSE",
+        "confidence": 0.9984557032585144
+      },
+      {
+        "text": "رقم",
+        "confidence": 0.9659178853034973
+      },
+      {
+        "text": "اللوحة",
+        "confidence": 0.9132182598114014
+      },
+      {
+        "text": ":",
+        "confidence": 0.7975698113441467
+      },
+      {
+        "text": "بب",
+        "confidence": 0.864041805267334
+      },
+      {
+        "text": "نوع الوحة  خصوصي",
+        "confidence": 0.7788952589035034
+      },
+      {
+        "text": "نوع المركبة",
+        "confidence": 0.9373869299888611
+      },
+      {
+        "text": "تويوتا صالون كورولا",
+        "confidence": 0.9648950695991516
+      },
+      {
+        "text": "اللون",
+        "confidence": 0.9435396194458008
+      },
+      {
+        "text": "ابيض",
+        "confidence": 0.7769114375114441
+      },
+      {
+        "text": "المنشاء",
+        "confidence": 0.9950881600379944
+      },
+      {
+        "text": "الولايات",
+        "confidence": 0.9383055567741394
+      },
+      {
+        "text": "المتحدة الامريكية",
+        "confidence": 0.9826736450195312
+      },
+      {
+        "text": "سنة الطرار",
+        "confidence": 0.9109429121017456
+      },
+      {
+        "text": "سعة المحرك",
+        "confidence": 0.9689041376113892
+      },
+      {
+        "text": "الوزن فارغكجمالحمولة القصوى",
+        "confidence": 0.920826256275177
+      },
+      {
+        "text": "سنة الصلع",
+        "confidence": 0.8583561778068542
+      },
+      {
+        "text": "عدد الركاب ",
+        "confidence": 0.8189184069633484
+      },
+      {
+        "text": "عدد المحاور 2",
+        "confidence": 0.8862879276275635
+      },
+      {
+        "text": "كجم",
+        "confidence": 0.9424352645874023
+      },
+      {
+        "text": "رقم الاعدةالشاص",
+        "confidence": 0.7564228177070618
+      },
+      {
+        "text": "NIL: رقم المحرة",
+        "confidence": 0.8957913517951965
+      },
+      {
+        "text": "صلاحية",
+        "confidence": 0.9669051766395569
+      },
+      {
+        "text": "الرخصة من",
+        "confidence": 0.8941123485565186
+      },
+      {
+        "text": "2025/05/06",
+        "confidence": 0.9994338750839233
+      }
+    ]
+  },
+  "rag_chunks": [
+    {
+      "source_file": "Mulkiya_front.jpg",
+      "document_type": "structured_json",
+      "chunk_id": "chunk-1",
+      "text": "plate_number: \nplate_text: بب\nvehicle_type: خصوصي\nmake: تويوتا\nmodel: كورولا\ncolor: ابيض\nyear: \nvin_or_chassis: \nengine_cc: \nempty_weight_kg: \nmax_load_kg: \nseats: \nissue_date: \nexpiry_date: 2025/05/06\nowner_name: \nnotes: Heuristic extraction.\nsource.input: C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-iekh3kc1\\Mulkiya_front_normalized.png\nsource.lang: ar\nsource.fix_arabic_reverse: False\nsource.reshape_arabic: False",
+      "metadata": {
+        "chunk_index": 1,
+        "source_type": "structured_json"
+      }
+    }
+  ],
+  "artifacts": {
+    "chunk_source": "C:\\Users\\rasto\\AppData\\Local\\Temp\\upsure-poc-iekh3kc1\\Mulkiya_front_normalized_mulkya.json"
+  },
+  "note": "Mulkiya pipeline executed with card inference and OCR extraction."
+}

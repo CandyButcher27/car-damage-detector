@@ -1,0 +1,28 @@
+{
+  "plate_number": "52514",
+  "plate_text": "بب",
+  "vehicle_type": "خصوصي",
+  "make": "تويوتا",
+  "model": "كورولا",
+  "color": "ابيض",
+  "year": 2018,
+  "model_year": 2019,
+  "country_of_origin": "الولايات المتحدة الامريكية",
+  "vin_or_chassis": "5YFBURHE7KP872881",
+  "engine_number": "NIL",
+  "engine_cc": 1800,
+  "empty_weight_kg": 2000,
+  "max_load_kg": 2000,
+  "seats": 4,
+  "issue_date": "2024/06/02",
+  "expiry_date": "2025/05/06",
+  "owner_name": null,
+  "notes": "Heuristic extraction with auxiliary English OCR fallback.",
+  "source": {
+    "input": "Samples\\Mulkiya_front.jpg",
+    "lang": "ar",
+    "auxiliary_ocr_lang": "en",
+    "fix_arabic_reverse": false,
+    "reshape_arabic": false
+  }
+}
