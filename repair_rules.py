@@ -4,10 +4,10 @@ REPAIR_RULES: dict[tuple[str, str], dict] = {
     ("car-part-crack", "moderate"): {"action": "Replace cracked part",                   "replace": True},
     ("car-part-crack", "severe"):   {"action": "Replace part + inspect structural frame", "replace": True},
 
-    # ── detachment ────────────────────────────────────────────────────────────
-    ("detachment", "minor"):    {"action": "Reattach — adhesive/clip replacement",        "replace": False},
-    ("detachment", "moderate"): {"action": "Replace part + mounting bracket",             "replace": True},
-    ("detachment", "severe"):   {"action": "Replace part + structural integrity check",   "replace": True},
+    # ── deformation (severity from bbox area) ─────────────────────────────────
+    ("deformation", "minor"):    {"action": "Repair — paintless dent repair (PDR)",          "replace": False},
+    ("deformation", "moderate"): {"action": "Repair — PDR + repaint panel",                  "replace": False},
+    ("deformation", "severe"):   {"action": "Replace panel + inspect frame rails",            "replace": True},
 
     # ── flat-tire ─────────────────────────────────────────────────────────────
     ("flat-tire", "minor"):    {"action": "Repair — patch tire",                          "replace": False},
@@ -24,43 +24,14 @@ REPAIR_RULES: dict[tuple[str, str], dict] = {
     ("lamp-crack", "moderate"): {"action": "Replace full lamp assembly",                  "replace": True},
     ("lamp-crack", "severe"):   {"action": "Replace lamp assembly + inspect mount",       "replace": True},
 
-    # ── minor-deformation ─────────────────────────────────────────────────────
-    ("minor-deformation", "minor"):    {"action": "Repair — paintless dent repair (PDR)",     "replace": False},
-    ("minor-deformation", "moderate"): {"action": "Repair — PDR + repaint",                   "replace": False},
-    ("minor-deformation", "severe"):   {"action": "Replace panel",                            "replace": True},
-
-    # ── moderate-deformation ──────────────────────────────────────────────────
-    ("moderate-deformation", "minor"):    {"action": "Repair — PDR + repaint",                "replace": False},
-    ("moderate-deformation", "moderate"): {"action": "Replace panel",                         "replace": True},
-    ("moderate-deformation", "severe"):   {"action": "Replace panel + inspect frame rails",   "replace": True},
-
-    # ── paint-chips ───────────────────────────────────────────────────────────
-    ("paint-chips", "minor"):    {"action": "Repair — touch-up paint",                    "replace": False},
-    ("paint-chips", "moderate"): {"action": "Repair — repaint panel",                     "replace": False},
-    ("paint-chips", "severe"):   {"action": "Repair — full repaint with primer coat",     "replace": False},
-
-    # ── scratches ─────────────────────────────────────────────────────────────
+    # ── scratches (absorbs paint-chips) ───────────────────────────────────────
     ("scratches", "minor"):    {"action": "Repair — machine polish + touch-up paint",     "replace": False},
     ("scratches", "moderate"): {"action": "Repair — repaint panel",                       "replace": False},
     ("scratches", "severe"):   {"action": "Repair — filler + full panel repaint",         "replace": False},
-
-    # ── severe-deformation ────────────────────────────────────────────────────
-    ("severe-deformation", "minor"):    {"action": "Replace panel + structural check",    "replace": True},
-    ("severe-deformation", "moderate"): {"action": "Replace panel + frame realignment",   "replace": True},
-    ("severe-deformation", "severe"):   {"action": "Replace panel + frame repair + structural integrity inspection", "replace": True},
-
-    # ── side-mirror-crack ─────────────────────────────────────────────────────
-    ("side-mirror-crack", "minor"):    {"action": "Replace mirror glass",                 "replace": True},
-    ("side-mirror-crack", "moderate"): {"action": "Replace full mirror assembly",         "replace": True},
-    ("side-mirror-crack", "severe"):   {"action": "Replace mirror assembly + inspect mount", "replace": True},
 }
 
 
 def get_severity(damage_area: float, car_area: float) -> str:
-    """
-    damage_area, car_area: pixel areas (w * h from bbox).
-    Returns: 'minor' | 'moderate' | 'severe'
-    """
     if car_area <= 0:
         return "minor"
     ratio = damage_area / car_area

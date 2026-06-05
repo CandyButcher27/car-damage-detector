@@ -3,7 +3,7 @@ paths:
   label_dir:        labels
   dataset_csv:      dataset.csv
   model_onnx:       models/damage_model_single.onnx
-  yolo_onnx:        models/damage_detector.onnx
+  yolo_onnx:        models/damage_detector_v2.onnx
 
 yolo:
   img_size:     640
@@ -11,16 +11,11 @@ yolo:
   iou_thresh:   0.45
   classes:
     - car-part-crack
-    - detachment
+    - deformation
     - flat-tire
     - glass-crack
     - lamp-crack
-    - minor-deformation
-    - moderate-deformation
-    - paint-chips
     - scratches
-    - severe-deformation
-    - side-mirror-crack
 
 severity:
   minor_max:    0.05
