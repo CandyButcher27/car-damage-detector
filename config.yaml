@@ -1,18 +1,30 @@
 paths:
-  image_dir:                  images
-  label_dir:                  labels
-  dataset_csv:                dataset.csv
-  dataset_verified_csv:       dataset_verified.csv
-  model_pth:                  models/damage_model.pth
-  model_onnx:                 models/damage_model_single.onnx
-  damage_type_dataset_csv:    damage_type_dataset.csv
-  damage_type_model_pth:      models/damage_type_model.pth
-  damage_type_model_onnx:     models/damage_type_model.onnx
+  image_dir:        images
+  label_dir:        labels
+  dataset_csv:      dataset.csv
+  model_onnx:       models/damage_model_single.onnx
+  yolo_onnx:        models/damage_detector.onnx
 
-damage_type:
-  classes:    [Paint Damage, Scratch, Dent, Bumper Damage, Other]
-  threshold:  0.4
-  num_classes: 5
+yolo:
+  img_size:     640
+  conf_thresh:  0.25
+  iou_thresh:   0.45
+  classes:
+    - car-part-crack
+    - detachment
+    - flat-tire
+    - glass-crack
+    - lamp-crack
+    - minor-deformation
+    - moderate-deformation
+    - paint-chips
+    - scratches
+    - severe-deformation
+    - side-mirror-crack
+
+severity:
+  minor_max:    0.05
+  moderate_max: 0.15
 
 image:
   extensions:      [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
@@ -30,18 +42,8 @@ ollama:
   temperature: 0.1
   max_tokens:  4096
 
-gemini:
-  model:               gemini-3-flash-preview
-  temperature:         0.1
-  max_tokens:          4096
-  high_conf_threshold: 0.85
-  clean_sample_rate:   0.30
-
 batch_label:
   workers: 4
-
-gemini_verify:
-  workers: 3
 
 training:
   model_name:   efficientnet_b2
