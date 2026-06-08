@@ -57,7 +57,7 @@ if load_keras_model is not None:
 POC_DIR = Path(__file__).resolve().parent
 OCR_SCRIPT = POC_DIR / "ocr_simple_test.py"
 MODEL_PATH = _resolve_model_path(POC_DIR, None)
-CAR_MODEL_PATH    = POC_DIR / "models" / "best_car_model.keras"
+CAR_MODEL_PATH    = POC_DIR / "models" / "best_car_model_v2.keras"
 DAMAGE_THRESHOLD  = 0.25
 DAMAGE_IMG_SIZE   = 260
 DAMAGE_MEAN       = np.array([0.485, 0.456, 0.406], dtype=np.float32)
