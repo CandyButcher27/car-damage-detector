@@ -74,7 +74,7 @@ Download the model files and place them in `models/` before starting the server.
 
 | Model file | Used by |
 |---|---|
-| `best_car_model.keras` | Car detection in `process_type=car`, `/predict/`, and `/predict/damage`. |
+| `best_car_model_v2.keras` | Car detection in `process_type=car`, `/predict/`, and `/predict/damage`. |
 | `card_noncard_classifier_model.keras` | Mulkiya card vs not-card classification. The loader also accepts `card_noncard_model.keras` if you use that legacy filename. |
 | `damage_model.onnx` | Car damage detection on `/predict/damage`. |
 
@@ -85,7 +85,7 @@ You may also see `mulkiya_classifier_model.keras` in `models/`; it is a legacy a
 
 ```text
 models/
-|-- best_car_model.keras
+|-- best_car_model_v2.keras
 |-- card_noncard_classifier_model.keras
 |-- mulkiya_classifier_model.keras
 `-- damage_model.onnx
@@ -523,7 +523,7 @@ If `/health` reports `damage_model_ready=false`, check:
 
 If car inference fails, confirm:
 
-1. `models/best_car_model.keras` exists.
+1. `models/best_car_model_v2.keras` exists.
 2. TensorFlow or Keras is installed.
 3. The file is not corrupted.
 
