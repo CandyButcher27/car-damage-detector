@@ -1436,11 +1436,24 @@ async def predict_damage(
                     pred["damages"] = []
             else:
                 pred["damages"] = []
+            if pred["damage_detected"] and not pred["damages"]:
+                p = pred["prob_damaged"]
+                sev = "severe" if p >= 0.80 else "moderate" if p >= 0.65 else "minor"
+                pred["damages"] = [{
+                    "type": "general-damage",
+                    "severity": sev,
+                    "confidence": round(p, 4),
+                    "bbox": [0.5, 0.5, 1.0, 1.0],
+                    "region": "unknown",
+                    "parts_at_risk": ["undetermined"],
+                    "replace": False,
+                    "repair_action": "Visual inspection required — damage detected but type could not be localized automatically",
+                }]
             per_view[view_name] = pred
             if pred["damage_detected"]:
                 overall_damaged = True
-            if pred["confidence_score"] > max_confidence:
-                max_confidence = pred["confidence_score"]
+                if pred["confidence_score"] > max_confidence:
+                    max_confidence = pred["confidence_score"]
 
     return {
         "damage_detected":      overall_damaged,
