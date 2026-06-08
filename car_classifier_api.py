@@ -36,7 +36,7 @@ app = FastAPI(
 )
 
 # Configuration
-MODEL_PATH = Path(__file__).parent / "models" / "best_car_model.keras"
+MODEL_PATH = Path(__file__).parent / "models" / "best_car_model_v2.keras"
 CAR_THRESHOLD = 0.35  # Using the lowered threshold for better recall
 FALLBACK_SIZE = 128
 
