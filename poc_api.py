@@ -108,6 +108,87 @@ def _resolve_damage_model_path() -> Path:
 
 DAMAGE_MODEL_PATH = _resolve_damage_model_path()
 
+# ── YOLO damage-type pipeline ─────────────────────────────────────────────────
+
+YOLO_SIZE             = 640
+YOLO_CONF             = 0.25
+YOLO_IOU              = 0.45
+YOLO_CLASSES          = ["car-part-crack", "deformation", "flat-tire", "glass-crack", "lamp-crack", "scratches"]
+SEVERITY_MINOR_MAX    = 0.05
+SEVERITY_MODERATE_MAX = 0.15
+_CAR_BBOX             = [0.5, 0.5, 1.0, 1.0]   # assumed full-image car bbox (Stage 0 dropped)
+
+
+def _resolve_yolo_model_path() -> Path:
+    env_path = os.getenv("UPSURE_YOLO_MODEL")
+    if env_path:
+        return Path(env_path)
+    candidates = [
+        POC_DIR / "models" / "damage_detector_v2.onnx",
+        POC_DIR / "models" / "damage_detector.onnx",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
+YOLO_MODEL_PATH = _resolve_yolo_model_path()
+
+_PARTS_RULES: dict[tuple[str, str], list[str]] = {
+    ("car-part-crack", "top_left"):     ["hood", "left_fender", "windshield_frame"],
+    ("car-part-crack", "top_right"):    ["hood", "right_fender", "windshield_frame"],
+    ("car-part-crack", "bottom_left"):  ["front_bumper", "radiator_grille", "left_rocker_panel"],
+    ("car-part-crack", "bottom_right"): ["front_bumper", "radiator_grille", "right_rocker_panel"],
+    ("car-part-crack", "center"):       ["door_panel", "body_frame", "sill"],
+    ("deformation", "top_left"):        ["hood", "left_fender", "left_a_pillar"],
+    ("deformation", "top_right"):       ["hood", "right_fender", "right_a_pillar"],
+    ("deformation", "bottom_left"):     ["front_bumper", "radiator_support", "left_frame_rail"],
+    ("deformation", "bottom_right"):    ["front_bumper", "radiator_support", "right_frame_rail"],
+    ("deformation", "center"):          ["door_panel", "b_pillar", "body_frame"],
+    ("flat-tire", "top_left"):          ["left_front_tire", "left_front_rim", "left_front_brake_caliper"],
+    ("flat-tire", "top_right"):         ["right_front_tire", "right_front_rim", "right_front_brake_caliper"],
+    ("flat-tire", "bottom_left"):       ["left_rear_tire", "left_rear_rim", "left_rear_suspension"],
+    ("flat-tire", "bottom_right"):      ["right_rear_tire", "right_rear_rim", "right_rear_suspension"],
+    ("flat-tire", "center"):            ["tire", "rim", "suspension"],
+    ("glass-crack", "top_left"):        ["windshield", "left_a_pillar", "wiper_linkage"],
+    ("glass-crack", "top_right"):       ["windshield", "right_a_pillar", "wiper_linkage"],
+    ("glass-crack", "bottom_left"):     ["rear_windshield", "left_c_pillar", "rear_wiper"],
+    ("glass-crack", "bottom_right"):    ["rear_windshield", "right_c_pillar", "rear_wiper"],
+    ("glass-crack", "center"):          ["side_window", "door_seal", "window_regulator"],
+    ("lamp-crack", "top_left"):         ["left_headlight_assembly", "left_indicator", "left_daytime_running_light"],
+    ("lamp-crack", "top_right"):        ["right_headlight_assembly", "right_indicator", "right_daytime_running_light"],
+    ("lamp-crack", "bottom_left"):      ["left_tail_light", "left_reverse_light", "left_brake_light"],
+    ("lamp-crack", "bottom_right"):     ["right_tail_light", "right_reverse_light", "right_brake_light"],
+    ("lamp-crack", "center"):           ["lamp_assembly", "indicator"],
+    ("scratches", "top_left"):          ["hood", "left_fender"],
+    ("scratches", "top_right"):         ["hood", "right_fender"],
+    ("scratches", "bottom_left"):       ["front_bumper", "left_rocker_panel"],
+    ("scratches", "bottom_right"):      ["rear_bumper", "right_rocker_panel"],
+    ("scratches", "center"):            ["door_panel"],
+}
+
+_REPAIR_RULES: dict[tuple[str, str], dict] = {
+    ("car-part-crack", "minor"):    {"action": "Repair — filler + repaint",                      "replace": False},
+    ("car-part-crack", "moderate"): {"action": "Replace cracked part",                            "replace": True},
+    ("car-part-crack", "severe"):   {"action": "Replace part + inspect structural frame",         "replace": True},
+    ("deformation",    "minor"):    {"action": "Repair — paintless dent repair (PDR)",            "replace": False},
+    ("deformation",    "moderate"): {"action": "Repair — PDR + repaint panel",                   "replace": False},
+    ("deformation",    "severe"):   {"action": "Replace panel + inspect frame rails",             "replace": True},
+    ("flat-tire",      "minor"):    {"action": "Repair — patch tire",                            "replace": False},
+    ("flat-tire",      "moderate"): {"action": "Replace tire",                                   "replace": True},
+    ("flat-tire",      "severe"):   {"action": "Replace tire + inspect rim and suspension",      "replace": True},
+    ("glass-crack",    "minor"):    {"action": "Repair — resin injection (if single crack)",     "replace": False},
+    ("glass-crack",    "moderate"): {"action": "Replace glass panel",                            "replace": True},
+    ("glass-crack",    "severe"):   {"action": "Replace glass + inspect frame seals",            "replace": True},
+    ("lamp-crack",     "minor"):    {"action": "Replace lamp lens",                              "replace": True},
+    ("lamp-crack",     "moderate"): {"action": "Replace full lamp assembly",                     "replace": True},
+    ("lamp-crack",     "severe"):   {"action": "Replace lamp assembly + inspect mount",          "replace": True},
+    ("scratches",      "minor"):    {"action": "Repair — machine polish + touch-up paint",       "replace": False},
+    ("scratches",      "moderate"): {"action": "Repair — repaint panel",                         "replace": False},
+    ("scratches",      "severe"):   {"action": "Repair — filler + full panel repaint",           "replace": False},
+}
+
 
 app = FastAPI(title="UpSure PoC Document and Car Pipeline")
 
@@ -122,6 +203,7 @@ _card_model: CardNonCardModel | None = None
 _car_model: Any | None = None
 _car_img_size = CAR_FALLBACK_SIZE
 _damage_session: ort.InferenceSession | None = None
+_yolo_session: ort.InferenceSession | None = None
 
 
 @app.middleware("http")
@@ -186,6 +268,15 @@ def _get_damage_session() -> ort.InferenceSession:
     return _damage_session
 
 
+def _get_yolo_session() -> ort.InferenceSession:
+    global _yolo_session
+    if _yolo_session is None:
+        if not YOLO_MODEL_PATH.exists():
+            raise FileNotFoundError(f"YOLO model not found at {YOLO_MODEL_PATH}")
+        _yolo_session = ort.InferenceSession(str(YOLO_MODEL_PATH), providers=["CPUExecutionProvider"])
+    return _yolo_session
+
+
 def _preprocess_for_damage(img_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = img.resize((DAMAGE_IMG_SIZE, DAMAGE_IMG_SIZE), Image.LANCZOS)
@@ -206,6 +297,94 @@ def _run_damage_inference(arr: np.ndarray) -> dict[str, Any]:
         "prob_damaged":     float(round(float(probs[1]), 4)),
         "prob_clean":       float(round(float(probs[0]), 4)),
     }
+
+
+def _preprocess_yolo(img_bytes: bytes) -> np.ndarray:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img = img.resize((YOLO_SIZE, YOLO_SIZE), Image.LANCZOS)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    return arr.transpose(2, 0, 1)[np.newaxis]
+
+
+def _iou_boxes(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    ax1 = box_a[0] - box_a[2] / 2; ay1 = box_a[1] - box_a[3] / 2
+    ax2 = box_a[0] + box_a[2] / 2; ay2 = box_a[1] + box_a[3] / 2
+    bx1 = box_b[0] - box_b[2] / 2; by1 = box_b[1] - box_b[3] / 2
+    bx2 = box_b[0] + box_b[2] / 2; by2 = box_b[1] + box_b[3] / 2
+    inter = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(0.0, min(ay2, by2) - max(ay1, by1))
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms(boxes: np.ndarray, scores: np.ndarray) -> list[int]:
+    order = scores.argsort()[::-1].tolist()
+    keep: list[int] = []
+    while order:
+        i = order.pop(0)
+        keep.append(i)
+        order = [j for j in order if _iou_boxes(boxes[i], boxes[j]) < YOLO_IOU]
+    return keep
+
+
+def _get_severity(damage_w: float, damage_h: float) -> str:
+    ratio = damage_w * damage_h
+    if ratio < SEVERITY_MINOR_MAX:
+        return "minor"
+    if ratio < SEVERITY_MODERATE_MAX:
+        return "moderate"
+    return "severe"
+
+
+def _get_region(bbox: list[float]) -> str:
+    dx = bbox[0] - _CAR_BBOX[0]
+    dy = bbox[1] - _CAR_BBOX[1]
+    rel_x = dx / (_CAR_BBOX[2] / 2)
+    rel_y = dy / (_CAR_BBOX[3] / 2)
+    if abs(rel_x) < 0.3 and abs(rel_y) < 0.3:
+        return "center"
+    if rel_y <= 0:
+        return "top_left" if rel_x <= 0 else "top_right"
+    return "bottom_left" if rel_x <= 0 else "bottom_right"
+
+
+def _run_yolo_pipeline(img_bytes: bytes) -> list[dict[str, Any]]:
+    arr    = _preprocess_yolo(img_bytes)
+    sess   = _get_yolo_session()
+    inp    = sess.get_inputs()[0].name
+    output = sess.run(None, {inp: arr})[0]    # (1, 10, 8400)
+    preds  = output[0].T                       # (8400, 10)
+
+    boxes        = preds[:, :4]
+    class_scores = preds[:, 4:]
+    class_ids    = np.argmax(class_scores, axis=1)
+    max_scores   = np.max(class_scores, axis=1)
+
+    mask = max_scores >= YOLO_CONF
+    boxes, class_ids, max_scores = boxes[mask], class_ids[mask], max_scores[mask]
+
+    if len(boxes) == 0:
+        return []
+
+    keep = _nms(boxes, max_scores)
+    results: list[dict[str, Any]] = []
+    for i in keep:
+        bbox_px  = boxes[i].tolist()
+        bbox     = [float(round(v / YOLO_SIZE, 4)) for v in bbox_px]
+        cls_name = YOLO_CLASSES[int(class_ids[i])]
+        severity = _get_severity(bbox[2], bbox[3])
+        region   = _get_region(bbox)
+        parts    = _PARTS_RULES.get((cls_name, region), [])
+        repair   = _REPAIR_RULES.get((cls_name, severity), {"action": "Manual inspection required", "replace": False})
+        results.append({
+            "type":          cls_name,
+            "confidence":    float(round(float(max_scores[i]), 4)),
+            "severity":      severity,
+            "bbox":          bbox,
+            "parts_at_risk": parts,
+            "repair_action": repair["action"],
+            "replace":       repair["replace"],
+        })
+    return results
 
 
 def _classify_car_image(image_path: Path) -> dict[str, Any]:
@@ -902,6 +1081,14 @@ async def health_check() -> dict[str, Any]:
         damage_model_ready = False
         damage_model_error = str(exc)
 
+    yolo_model_ready = True
+    yolo_model_error = None
+    try:
+        _get_yolo_session()
+    except Exception as exc:
+        yolo_model_ready = False
+        yolo_model_error = str(exc)
+
     return {
         "status": "ok",
         "model_path": str(MODEL_PATH),
@@ -909,6 +1096,9 @@ async def health_check() -> dict[str, Any]:
         "damage_model_path": str(DAMAGE_MODEL_PATH),
         "damage_model_ready": damage_model_ready,
         "damage_model_error": damage_model_error,
+        "yolo_model_path": str(YOLO_MODEL_PATH),
+        "yolo_model_ready": yolo_model_ready,
+        "yolo_model_error": yolo_model_error,
         "ocr_script": str(OCR_SCRIPT),
     }
 
@@ -1214,6 +1404,8 @@ async def predict_damage(
     except (FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
+    yolo_available = YOLO_MODEL_PATH.exists()
+
     per_view: dict[str, Any] = {}
     overall_damaged = False
     max_confidence = 0.0
@@ -1237,12 +1429,13 @@ async def predict_damage(
                     detail=f"Could not convert {view_name} upload to a damage model image: {exc}",
                 )
             pred = _run_damage_inference(arr)
-            pred["normalized"] = {
-                "kind": normalized.kind,
-                "mime_type": normalized.mime_type,
-                "converted": normalized.converted,
-                "details": normalized.details,
-            }
+            if pred["damage_detected"] and yolo_available:
+                try:
+                    pred["damages"] = _run_yolo_pipeline(normalized.data)
+                except Exception:
+                    pred["damages"] = []
+            else:
+                pred["damages"] = []
             per_view[view_name] = pred
             if pred["damage_detected"]:
                 overall_damaged = True
