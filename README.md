@@ -13,9 +13,10 @@ The service can:
 3. Run OCR on images and PDFs.
 4. Extract Mulkiya data when OCR is enabled.
 5. Inspect general files and return useful metadata and previews.
-6. Detect damage on one to four vehicle-view images.
-7. Produce RAG-friendly JSON chunks from OCR or structured JSON outputs.
-8. Benchmark latency across the available routes.
+6. Detect damage on one to four vehicle-view images (binary: damaged vs clean).
+7. When damage is detected, run a five-stage severity pipeline: damage type, severity (minor/moderate/severe), parts at risk, and repair or replace recommendation.
+8. Produce RAG-friendly JSON chunks from OCR or structured JSON outputs.
+9. Benchmark latency across the available routes.
 
 ## Main Files
 
@@ -76,10 +77,13 @@ Download the model files and place them in `models/` before starting the server.
 |---|---|
 | `best_car_model_v2.keras` | Car detection in `process_type=car`, `/predict/`, and `/predict/damage`. |
 | `card_noncard_classifier_model.keras` | Mulkiya card vs not-card classification. The loader also accepts `card_noncard_model.keras` if you use that legacy filename. |
-| `damage_model.onnx` | Car damage detection on `/predict/damage`. |
+| `damage_model.onnx` | Stage 1 binary damage detection on `/predict/damage` (EfficientNet-B2, ONNX). |
+| `damage_detector_v2.onnx` | Stage 2 damage-type detection on `/predict/damage` (YOLOv8n, 6 classes, ONNX). Only runs when Stage 1 detects damage. |
 
-There is also support for `digiLifeDoc_damage_model.onnx` as a fallback damage-model filename.
+There is also support for `digiLifeDoc_damage_model.onnx` as a fallback binary damage-model filename, and `damage_detector.onnx` as a fallback YOLO filename.
 You may also see `mulkiya_classifier_model.keras` in `models/`; it is a legacy artifact and is not the default filename used by the current loader.
+
+Override the YOLO model path at runtime with `UPSURE_YOLO_MODEL`.
 
 ### Expected `models/` contents
 
@@ -88,7 +92,8 @@ models/
 |-- best_car_model_v2.keras
 |-- card_noncard_classifier_model.keras
 |-- mulkiya_classifier_model.keras
-`-- damage_model.onnx
+|-- damage_model.onnx
+`-- damage_detector_v2.onnx
 ```
 
 If your damage model was exported with external data, the companion `.data` file must live next to the `.onnx` file.
@@ -170,9 +175,11 @@ Returns a small status message showing that the service is running.
 Returns:
 
 1. The resolved model paths.
-2. Whether the damage model is ready.
-3. Any damage-model error message.
-4. The OCR script path.
+2. Whether the binary damage model is ready (`damage_model_ready`).
+3. Any binary damage model error message.
+4. Whether the YOLO damage-type model is ready (`yolo_model_ready`).
+5. Any YOLO model error message.
+6. The OCR script path.
 
 ### `POST /predict/`
 
@@ -316,9 +323,21 @@ Behavior:
 
 1. Each view is normalized to a JPEG model input.
 2. PDFs are rendered to the first page before classification.
-3. The model runs on CPU through ONNX Runtime.
-4. `damage_detected=true` if any uploaded view is classified as damaged.
-5. `overall_confidence` is the highest confidence score among the submitted views.
+3. Stage 1 (EfficientNet-B2 binary model) runs on CPU through ONNX Runtime.
+4. `damage_detected=true` if any view is classified as damaged.
+5. `overall_confidence` is the highest confidence score among all submitted views.
+6. For each view where damage is detected, Stage 2 (YOLOv8n) runs automatically and populates a `damages` list with per-detection detail.
+7. If the YOLO model is not present, Stage 2 is skipped silently and `damages` is an empty list.
+
+Each entry in `damages` contains:
+
+1. `type` — one of `car-part-crack`, `deformation`, `flat-tire`, `glass-crack`, `lamp-crack`, `scratches`
+2. `confidence` — YOLO detection confidence
+3. `severity` — `minor`, `moderate`, or `severe` (derived from bounding box area)
+4. `bbox` — normalized bounding box `[cx, cy, w, h]` in `[0, 1]`
+5. `parts_at_risk` — list of affected parts based on damage type and image region
+6. `repair_action` — recommended action string
+7. `replace` — boolean indicating whether replacement is recommended over repair
 
 Example:
 
@@ -518,6 +537,15 @@ If `/health` reports `damage_model_ready=false`, check:
 1. That `models/damage_model.onnx` exists.
 2. That any external data file required by the ONNX export exists next to it.
 3. That `UPSURE_DAMAGE_MODEL` is not pointing to the wrong file.
+
+### YOLO damage-type model not ready
+
+If `/health` reports `yolo_model_ready=false`, check:
+
+1. That `models/damage_detector_v2.onnx` exists.
+2. That `UPSURE_YOLO_MODEL` is not pointing to the wrong file.
+
+Note: the YOLO model missing is non-fatal. The `/predict/damage` endpoint still runs Stage 1 and returns binary results. The `damages` field will be an empty list for all views.
 
 ### Car model load failure
 

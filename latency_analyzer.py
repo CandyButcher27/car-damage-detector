@@ -243,7 +243,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--left-file",  type=Path, default=None,
                         help="Left view image for /predict/damage benchmark.")
     parser.add_argument("--right-file", type=Path, default=None,
-                        help="Right view image for /predict/damage benchmark.")
+                        help=(
+                            "Right view image for /predict/damage benchmark. "
+                            "Note: /predict/damage runs a two-stage pipeline. "
+                            "Stage 1 (EfficientNet-B2 binary) always runs. "
+                            "Stage 2 (YOLOv8n damage-type) runs only when Stage 1 detects damage. "
+                            "Use damaged car images to benchmark the full v2 pipeline latency."
+                        ))
     return parser
 
 
@@ -651,12 +657,12 @@ def main() -> int:
         ),
         Scenario(
             "predict-damage",
-            "Unified POST /predict/damage (4 views)",
+            "Unified POST /predict/damage (4 views, v2 pipeline)",
             lambda: (
                 lambda chosen: _send_damage_post(
                     f"{unified_base}/predict/damage",
                     args.timeout,
-                    "Unified POST /predict/damage (4 views)",
+                    "Unified POST /predict/damage (4 views, v2 pipeline)",
                     chosen[0],
                     chosen[1],
                 )
