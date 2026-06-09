@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -22,9 +23,29 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, ImageOps
+from starlette.concurrency import run_in_threadpool
 
 from card_inference import CardNonCardModel, _resolve_model_path
 from rag_json_chunker import chunk_json_file
+
+try:
+    from plate_pipeline import (
+        get_model as _get_anpr_model,
+        get_reader as _get_anpr_reader,
+        run_pipeline as _run_anpr_pipeline,
+    )
+    _ANPR_AVAILABLE = True
+except Exception:
+    _ANPR_AVAILABLE = False
+
+    def _get_anpr_model():  # type: ignore[misc]
+        raise RuntimeError("plate_pipeline not importable")
+
+    def _get_anpr_reader():  # type: ignore[misc]
+        raise RuntimeError("plate_pipeline not importable")
+
+    def _run_anpr_pipeline(img_bytes: bytes, **kwargs) -> dict:  # type: ignore[misc]
+        raise RuntimeError("plate_pipeline not importable")
 
 try:
     from keras.models import load_model as load_keras_model
@@ -134,6 +155,9 @@ def _resolve_yolo_model_path() -> Path:
 
 
 YOLO_MODEL_PATH = _resolve_yolo_model_path()
+
+ANPR_MODEL_PATH = POC_DIR / "models" / "anpr_plate_detector"
+ANPR_VIEW_PRIORITY = ["front", "back", "left", "right"]
 
 _PARTS_RULES: dict[tuple[str, str], list[str]] = {
     ("car-part-crack", "top_left"):     ["hood", "left_fender", "windshield_frame"],
@@ -1089,6 +1113,20 @@ async def health_check() -> dict[str, Any]:
         yolo_model_ready = False
         yolo_model_error = str(exc)
 
+    anpr_model_ready = False
+    anpr_model_error = None
+    if not _ANPR_AVAILABLE:
+        anpr_model_error = "plate_pipeline module not importable"
+    elif not ANPR_MODEL_PATH.exists():
+        anpr_model_error = f"ANPR model directory not found at {ANPR_MODEL_PATH}"
+    else:
+        try:
+            _get_anpr_model()
+            _get_anpr_reader()
+            anpr_model_ready = True
+        except Exception as exc:
+            anpr_model_error = str(exc)
+
     return {
         "status": "ok",
         "model_path": str(MODEL_PATH),
@@ -1099,6 +1137,9 @@ async def health_check() -> dict[str, Any]:
         "yolo_model_path": str(YOLO_MODEL_PATH),
         "yolo_model_ready": yolo_model_ready,
         "yolo_model_error": yolo_model_error,
+        "anpr_model_path": str(ANPR_MODEL_PATH),
+        "anpr_model_ready": anpr_model_ready,
+        "anpr_model_error": anpr_model_error,
         "ocr_script": str(OCR_SCRIPT),
     }
 
@@ -1377,6 +1418,44 @@ async def process_document(
     raise HTTPException(status_code=500, detail="Unhandled process_type.")
 
 
+def _damage_for_view(img_bytes: bytes, yolo_available: bool) -> dict[str, Any]:
+    pred = _run_damage_inference(_preprocess_for_damage(img_bytes))
+    if pred["damage_detected"] and yolo_available:
+        try:
+            pred["damages"] = _run_yolo_pipeline(img_bytes)
+        except Exception:
+            pred["damages"] = []
+    else:
+        pred["damages"] = []
+    if pred["damage_detected"] and not pred["damages"]:
+        p = pred["prob_damaged"]
+        sev = "severe" if p >= 0.80 else "moderate" if p >= 0.65 else "minor"
+        pred["damages"] = [{
+            "type": "general-damage",
+            "severity": sev,
+            "confidence": round(p, 4),
+            "bbox": [0.5, 0.5, 1.0, 1.0],
+            "region": "unknown",
+            "parts_at_risk": ["undetermined"],
+            "replace": False,
+            "repair_action": "Visual inspection required — damage detected but type could not be localized automatically",
+        }]
+    return pred
+
+
+def _anpr_for_view(img_bytes: bytes) -> dict[str, Any]:
+    try:
+        result = _run_anpr_pipeline(img_bytes, is_oman_plate=True)
+        return {
+            "detected":   result.get("detected", False),
+            "plate_text": result.get("plate_text", ""),
+            "confidence": result.get("confidence", 0.0),
+            "num_plates": result.get("num_plates", 0),
+        }
+    except Exception as exc:
+        return {"detected": False, "plate_text": "", "confidence": 0.0, "num_plates": 0, "error": str(exc)}
+
+
 @app.post("/predict/damage")
 async def predict_damage(
     front: UploadFile | None = File(default=None),
@@ -1384,14 +1463,6 @@ async def predict_damage(
     left:  UploadFile | None = File(default=None),
     right: UploadFile | None = File(default=None),
 ) -> dict[str, Any]:
-    """
-    Car damage detection endpoint.
-    Accepts 1–4 vehicle view images (front/back/left/right).
-    All views that are confirmed cars are run through the damage model.
-    damage_detected=true if ANY view is damaged.
-
-    Call this AFTER /api/v1/process?process_type=car confirms is_car=true for each view.
-    """
     views: dict[str, UploadFile] = {
         k: v for k, v in [("front", front), ("back", back), ("left", left), ("right", right)] if v
     }
@@ -1406,60 +1477,70 @@ async def predict_damage(
 
     yolo_available = YOLO_MODEL_PATH.exists()
 
+    # Phase 1: read + decode all uploads (async, sequential — cannot await in threads)
+    view_img_bytes: dict[str, bytes] = {}
+    for view_name, upload in views.items():
+        if not upload.filename:
+            raise HTTPException(status_code=400, detail=f"{view_name} upload must have a filename.")
+        try:
+            raw = await upload.read()
+            if _is_pdf(upload):
+                norm_bytes, _ = _pdf_first_page_to_jpeg(raw)
+            else:
+                norm_bytes, _ = _image_bytes_to_format(raw, output_format="JPEG")
+            view_img_bytes[view_name] = norm_bytes
+        except Exception as exc:
+            raise HTTPException(status_code=415, detail=f"Could not process {view_name}: {exc}")
+
+    # Phase 2: damage inference (all views) + ANPR (best available view) — parallel via thread pool
+    anpr_source_view = next((v for v in ANPR_VIEW_PRIORITY if v in view_img_bytes), None)
+    run_anpr = _ANPR_AVAILABLE and anpr_source_view is not None
+
+    damage_coros = [
+        run_in_threadpool(_damage_for_view, img_bytes, yolo_available)
+        for img_bytes in view_img_bytes.values()
+    ]
+
+    if run_anpr:
+        all_results = await asyncio.gather(
+            *damage_coros,
+            run_in_threadpool(_anpr_for_view, view_img_bytes[anpr_source_view]),
+            return_exceptions=True,
+        )
+        damage_results = list(all_results[:-1])
+        anpr_raw = all_results[-1]
+    else:
+        damage_results = await asyncio.gather(*damage_coros, return_exceptions=True)
+        anpr_raw = None
+
+    # Aggregate damage results
     per_view: dict[str, Any] = {}
     overall_damaged = False
     max_confidence = 0.0
 
-    with tempfile.TemporaryDirectory(prefix="upsure-damage-") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        for view_name, upload in views.items():
-            if not upload.filename:
-                raise HTTPException(status_code=400, detail=f"{view_name} upload must have a filename.")
-            try:
-                normalized = _normalize_for_image_model(
-                    file_bytes=await upload.read(),
-                    source_name=Path(upload.filename).name,
-                    temp_dir=temp_dir,
-                    is_pdf_file=_is_pdf(upload),
-                )
-                arr = _preprocess_for_damage(normalized.data)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=415,
-                    detail=f"Could not convert {view_name} upload to a damage model image: {exc}",
-                )
-            pred = _run_damage_inference(arr)
-            if pred["damage_detected"] and yolo_available:
-                try:
-                    pred["damages"] = _run_yolo_pipeline(normalized.data)
-                except Exception:
-                    pred["damages"] = []
-            else:
-                pred["damages"] = []
-            if pred["damage_detected"] and not pred["damages"]:
-                p = pred["prob_damaged"]
-                sev = "severe" if p >= 0.80 else "moderate" if p >= 0.65 else "minor"
-                pred["damages"] = [{
-                    "type": "general-damage",
-                    "severity": sev,
-                    "confidence": round(p, 4),
-                    "bbox": [0.5, 0.5, 1.0, 1.0],
-                    "region": "unknown",
-                    "parts_at_risk": ["undetermined"],
-                    "replace": False,
-                    "repair_action": "Visual inspection required — damage detected but type could not be localized automatically",
-                }]
-            per_view[view_name] = pred
-            if pred["damage_detected"]:
+    for view_name, result in zip(view_img_bytes.keys(), damage_results):
+        if isinstance(result, Exception):
+            per_view[view_name] = {"error": str(result), "damage_detected": False, "damages": []}
+        else:
+            per_view[view_name] = result
+            if result.get("damage_detected"):
                 overall_damaged = True
-                if pred["confidence_score"] > max_confidence:
-                    max_confidence = pred["confidence_score"]
+                if result.get("confidence_score", 0.0) > max_confidence:
+                    max_confidence = result["confidence_score"]
+
+    # Build plate result
+    plate: dict[str, Any] = {"detected": False, "plate_text": "", "confidence": 0.0, "source_view": None}
+    if anpr_raw is not None and not isinstance(anpr_raw, Exception):
+        plate = {**anpr_raw, "source_view": anpr_source_view}
+    elif not _ANPR_AVAILABLE:
+        plate["error"] = "ANPR module not available"
 
     return {
         "damage_detected":      overall_damaged,
-        "total_views_analyzed": len(views),
+        "total_views_analyzed": len(per_view),
         "overall_confidence":   round(max_confidence, 4),
         "per_view":             per_view,
+        "plate":                plate,
     }
 
 
