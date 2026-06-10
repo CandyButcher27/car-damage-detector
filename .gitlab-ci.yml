@@ -5,31 +5,9 @@ variables:
   DOCKER_REGISTRY: asia.gcr.io/inbox-gcr/projects
   DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
-  SECRET_DETECTION_ENABLED: 'true'
-
-include:
-  - template: Auto-DevOps.gitlab-ci.yml
 
 stages:
-  - sast
-  - test
-  - secret-detection
-  - qc_test
-  - sonar
   - build
-  - security_scan
-  - review
-  - dast
-  - staging
-  - canary
-  # - production
-  # - incremental rollout 10%
-  # - incremental rollout 25%
-  # - incremental rollout 50%
-  # - incremental rollout 100%
-  - performance
-  - deploy
-  - cleanup
 
 .bootstrap: &bootstrap
   before_script:
@@ -37,12 +15,6 @@ stages:
     - docker login -u _json_key -p "$INBOX_GCR_ACCESS_KEY" https://asia.gcr.io
   after_script:
     - docker system prune -af --volumes
-
-# sast:
-#   stage: test
-
-# secret_detection:
-#   stage: secret-detection
 
 build:
   <<: *bootstrap
