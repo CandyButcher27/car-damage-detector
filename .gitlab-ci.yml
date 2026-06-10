@@ -55,5 +55,5 @@ build:
     - docker builder prune -af || true
     - docker build --no-cache -t "${DOCKER_REGISTRY}/data-ingestion:${CI_PIPELINE_ID}" -f Dockerfile .
     - docker push "${DOCKER_REGISTRY}/data-ingestion:${CI_PIPELINE_ID}"
-  only:
-    - backup-jun10
+  rules:
+    - if: $CI_COMMIT_BRANCH == "backup-jun10"
