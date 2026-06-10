@@ -1,38 +1,38 @@
-# UpSure PoC Documentation
+# UpSure Combined PoC
 
-This repository contains a proof-of-concept FastAPI service for document, Mulkiya, car, OCR, and damage-analysis workflows. The main goal is to take a single upload, route it through the right pipeline, and return a structured response that is easy to consume in downstream systems.
+FastAPI proof of concept for vehicle, Mulkiya, OCR, file-inspection, damage-analysis, and ANPR workflows.
 
-The project is centered around `poc_api.py`, which exposes one unified API for most workflows, plus a standalone car-classifier service for backward compatibility.
+The main service is `poc_api.py`. It accepts uploads, normalizes each file into the format required by the selected pipeline, runs the appropriate model or OCR process, and returns a structured JSON response. `car_classifier_api.py` is a smaller standalone car-classifier service kept for compatibility and quick smoke tests.
 
-## What This Project Does
+## What The Project Does
 
-The service can:
+1. Classifies whether an image or first PDF page contains a car.
+2. Classifies Mulkiya-style images as card or not-card.
+3. Runs OCR over images and PDFs.
+4. Extracts structured Mulkiya fields from OCR text.
+5. Inspects general files without OCR or model inference.
+6. Detects vehicle damage across one to four uploaded views.
+7. Runs damage localization/type detection only when binary damage is detected.
+8. Runs ANPR on the best available vehicle view and reads plate text.
+9. Produces RAG-friendly chunks from OCR JSON or structured JSON artifacts.
+10. Provides latency and benchmark utilities for the available routes.
 
-1. Detect whether an uploaded image contains a car.
-2. Classify Mulkiya-style documents as card or not-card.
-3. Run OCR on images and PDFs.
-4. Extract Mulkiya data when OCR is enabled.
-5. Inspect general files and return useful metadata and previews.
-6. Detect damage on one to four vehicle-view images (binary: damaged vs clean).
-7. When damage is detected, run a five-stage severity pipeline: damage type, severity (minor/moderate/severe), parts at risk, and repair or replace recommendation.
-8. Produce RAG-friendly JSON chunks from OCR or structured JSON outputs.
-9. Benchmark latency across the available routes.
-
-## Main Files
+## Main Entry Points
 
 | File | Purpose |
 |---|---|
-| `poc_api.py` | Main FastAPI app. Handles unified routing, OCR orchestration, file normalization, and damage detection. |
-| `car_classifier_api.py` | Standalone car-classifier API kept for compatibility and quick testing. |
-| `card_inference.py` | Lightweight card vs not-card model loader plus CLI and GUI helpers. |
-| `ocr_simple_test.py` | OCR pipeline script used by the API to produce OCR JSON and Mulkiya extraction artifacts. |
-| `rag_json_chunker.py` | Turns OCR or structured JSON into overlapping chunks that are suitable for retrieval-augmented workflows. |
-| `latency_analyzer.py` | Benchmarks the unified API and reports latency-focused metrics. |
-| `benchmark_everything.py` | Broader benchmark runner that collects latency plus response-quality metrics and can save results. |
-| `requirements.txt` | Python dependencies for the project. |
-| `Samples/` | Example files for smoke testing, manual validation, and benchmarking. |
+| `poc_api.py` | Main FastAPI app. Owns routing, normalization, OCR orchestration, model calls, damage flow, ANPR integration, and response assembly. |
+| `car_classifier_api.py` | Standalone car-classifier API using `best_car_model_v2.keras`. |
+| `card_inference.py` | Lightweight NumPy/HDF5 loader for the card vs not-card Keras model. |
+| `ocr_simple_test.py` | OCR worker script called by `poc_api.py` in a subprocess. Produces OCR JSON and optional Mulkiya JSON. |
+| `plate_pipeline.py` | ANPR pipeline: plate detection with YOLOv4 TensorFlow SavedModel and plate OCR with PaddleOCR. |
+| `rag_json_chunker.py` | Converts OCR or structured JSON into chunk objects suitable for RAG workflows. |
+| `latency_analyzer.py` | Latency-focused benchmark runner. |
+| `benchmark_everything.py` | Broader benchmark runner that can save JSON/CSV results. |
+| `Samples/` | Example images, PDFs, and converted formats for smoke testing. |
+| `models/` | Local model artifacts. Model binaries are expected to be downloaded locally. |
 
-## Folder Layout
+## Project Layout
 
 ```text
 .
@@ -40,6 +40,7 @@ The service can:
 |-- car_classifier_api.py
 |-- card_inference.py
 |-- ocr_simple_test.py
+|-- plate_pipeline.py
 |-- rag_json_chunker.py
 |-- latency_analyzer.py
 |-- benchmark_everything.py
@@ -49,116 +50,104 @@ The service can:
 `-- Samples/
 ```
 
-The `models/` directory is expected to contain downloaded model artifacts. It is intentionally not meant for checked-in model binaries.
+## Pipeline Diagram
 
-## How The Unified API Works
+![UpSure pipeline diagram](<Pipeline diagram.png>)
 
-The main service accepts an uploaded file and a `process_type` value. That value determines the pipeline:
+## Model Call Order
 
-| `process_type` | What happens |
+| Route or workflow | Model sequence |
 |---|---|
-| `car` | Converts the input into a model-ready image and runs the car classifier. |
-| `mulkiya` | Runs card vs not-card classification, then OCR and Mulkiya extraction unless `skip_ocr=true`. |
-| `pdf` | Ensures the file is available as PDF, then runs OCR and returns extracted line data. |
-| `file` | Does not run OCR or classification. Returns file metadata, previews, and lightweight inspection data. |
+| `/predict/` | `best_car_model_v2.keras` |
+| `/api/v1/process`, `process_type=car` | `best_car_model_v2.keras` |
+| `/api/v1/process`, `process_type=mulkiya`, image input | `card_noncard_classifier_model.keras` -> if `skip_ocr=false`: `PaddleOCR` -> rule-based Mulkiya extraction -> RAG chunking |
+| `/api/v1/process`, `process_type=mulkiya`, PDF input | Card classifier is skipped -> if `skip_ocr=false`: PDF text layer or `PaddleOCR` -> rule-based extraction -> RAG chunking |
+| `/api/v1/process`, `process_type=pdf` | PDF text layer when `prefer_pdf_text=true` and text exists, otherwise `PaddleOCR` -> RAG chunking |
+| `/api/v1/process`, `process_type=file` | No ML model. File inspection only, then JSON chunking. |
+| `/predict/damage` | Per submitted view: `damage_model.onnx` -> if damaged and YOLO model exists: `damage_detector_v2.onnx`. In parallel, one selected view runs ANPR: YOLOv4 plate detector -> PaddleOCR plate OCR. |
+| `car_classifier_api.py` standalone service | Loads `best_car_model_v2.keras` at startup, then reuses it for `/predict/`. |
 
-The API is designed to normalize input before inference:
-
-1. Images can be converted to JPEG or PNG depending on the target pipeline.
-2. PDFs can be rendered to the first page as an image when a model needs image input.
-3. Images can also be wrapped into a one-page PDF when the OCR pipeline expects PDF input.
-4. The response includes a `normalized` block so you can see what happened to the original file.
+Models in `poc_api.py` are lazy-loaded. The first request that needs a model loads it into memory; later requests reuse the cached model/session.
 
 ## Model Artifacts
 
-Download the model files and place them in `models/` before starting the server.
+Place model files in `models/` before starting the services.
 
-| Model file | Used by |
+| Model artifact | Used by |
 |---|---|
-| `best_car_model_v2.keras` | Car detection in `process_type=car`, `/predict/`, and `/predict/damage`. |
-| `card_noncard_classifier_model.keras` | Mulkiya card vs not-card classification. The loader also accepts `card_noncard_model.keras` if you use that legacy filename. |
-| `damage_model.onnx` | Stage 1 binary damage detection on `/predict/damage` (EfficientNet-B2, ONNX). |
-| `damage_detector_v2.onnx` | Stage 2 damage-type detection on `/predict/damage` (YOLOv8n, 6 classes, ONNX). Only runs when Stage 1 detects damage. |
+| `best_car_model_v2.keras` | Car classification in `/predict/`, `/api/v1/process` with `process_type=car`, and the standalone car service. |
+| `card_noncard_classifier_model.keras` | Mulkiya card vs not-card classification for image uploads. The loader also accepts the legacy filename `card_noncard_model.keras`. |
+| `damage_model.onnx` | Stage 1 binary damage classification for `/predict/damage`. Fallback filename: `digiLifeDoc_damage_model.onnx`. |
+| `damage_detector_v2.onnx` | Stage 2 YOLO damage-type/localization model for `/predict/damage`. Fallback filename: `damage_detector.onnx`. |
+| `models/anpr_plate_detector/` | TensorFlow SavedModel used by `plate_pipeline.py` for license-plate detection. |
+| `mulkiya_classifier_model.keras` | Legacy artifact. It is present in some setups but is not the default model used by the current loader. |
 
-There is also support for `digiLifeDoc_damage_model.onnx` as a fallback binary damage-model filename, and `damage_detector.onnx` as a fallback YOLO filename.
-You may also see `mulkiya_classifier_model.keras` in `models/`; it is a legacy artifact and is not the default filename used by the current loader.
-
-Override the YOLO model path at runtime with `UPSURE_YOLO_MODEL`.
-
-### Expected `models/` contents
+Expected local contents:
 
 ```text
 models/
 |-- best_car_model_v2.keras
 |-- card_noncard_classifier_model.keras
-|-- mulkiya_classifier_model.keras
 |-- damage_model.onnx
-`-- damage_detector_v2.onnx
+|-- damage_detector_v2.onnx
+|-- mulkiya_classifier_model.keras
+`-- anpr_plate_detector/
 ```
 
-If your damage model was exported with external data, the companion `.data` file must live next to the `.onnx` file.
+Useful model environment overrides:
 
-## Environment And Prerequisites
+```bat
+set UPSURE_DAMAGE_MODEL=D:\path\to\damage_model.onnx
+set UPSURE_YOLO_MODEL=D:\path\to\damage_detector_v2.onnx
+```
 
-You need:
+If an ONNX model was exported with external data, keep its companion `.data` file next to the `.onnx` file.
+
+## Environment
+
+Requirements:
 
 1. Python 3.10+.
-2. The packages listed in `requirements.txt`.
-3. A working OCR Python environment for `ocr_simple_test.py`.
-4. PyMuPDF for PDF-to-image conversion on the car and damage routes.
+2. Packages from `requirements.txt`.
+3. TensorFlow or Keras for the car model and ANPR SavedModel.
+4. ONNX Runtime for damage models.
+5. PaddleOCR for OCR and plate reading.
+6. PyMuPDF for PDF conversion and optional PDF text extraction.
 
-### OCR Python override
+### OCR Python Override
 
-`poc_api.py` looks for the OCR interpreter in `UPSURE_OCR_PYTHON`.
+`poc_api.py` runs `ocr_simple_test.py` as a subprocess. It picks the OCR interpreter in this order:
 
-If that variable is not set, the service tries these defaults:
+1. `UPSURE_OCR_PYTHON`, if set.
+2. `D:/UpSure/OCR_test/venv/Scripts/python.exe`, if it exists.
+3. `../OCR_test/venv/Scripts/python.exe` relative to this repository, if it exists.
+4. The current Python interpreter.
 
-1. `D:/UpSure/OCR_test/venv/Scripts/python.exe`
-2. `../OCR_test/venv/Scripts/python.exe` relative to this repository
-3. The current Python interpreter as a last fallback
-
-If OCR fails with an environment error, check that `UPSURE_OCR_PYTHON` points to the correct virtual environment.
-
-## Setup
-
-### 1. Create or activate a virtual environment
-
-```bat
-python -m venv .venv
-.\.venv\Scripts\activate
-```
-
-If you already have a working environment, reuse it.
-
-### 2. Install dependencies
-
-```bat
-pip install -r requirements.txt
-```
-
-### 3. Download the model files
-
-Place the model artifacts in `models/` before starting the API.
-
-### 4. Set the OCR interpreter if needed
+Set it explicitly when your OCR dependencies live in a separate environment:
 
 ```bat
 set UPSURE_OCR_PYTHON=D:\path\to\OCR_test\venv\Scripts\python.exe
 ```
 
-## Running The Services
+## Setup
 
-### Unified API
+```bat
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-This is the recommended entry point for most work:
+Then download or copy the required model artifacts into `models/`.
+
+## Run The Services
+
+Unified API, recommended for most testing:
 
 ```bat
 .\.venv\Scripts\python.exe -m uvicorn poc_api:app --host 0.0.0.0 --port 8000
 ```
 
-### Standalone car classifier
-
-Use this for a quick car-only smoke test or backward-compatible workflows:
+Standalone car classifier:
 
 ```bat
 .\.venv\Scripts\python.exe -m uvicorn car_classifier_api:app --host 0.0.0.0 --port 8001
@@ -168,18 +157,17 @@ Use this for a quick car-only smoke test or backward-compatible workflows:
 
 ### `GET /`
 
-Returns a small status message showing that the service is running.
+Returns a simple service status message.
 
 ### `GET /health`
 
-Returns:
+Checks and reports:
 
-1. The resolved model paths.
-2. Whether the binary damage model is ready (`damage_model_ready`).
-3. Any binary damage model error message.
-4. Whether the YOLO damage-type model is ready (`yolo_model_ready`).
-5. Any YOLO model error message.
-6. The OCR script path.
+1. Resolved model paths.
+2. Binary damage-model readiness and errors.
+3. YOLO damage-model readiness and errors.
+4. ANPR model/readiness and errors.
+5. OCR script path.
 
 ### `POST /predict/`
 
@@ -187,13 +175,13 @@ Direct car classification endpoint.
 
 Input:
 
-1. `file` as `multipart/form-data`.
+1. Multipart field `file`.
 
 Behavior:
 
-1. Images are normalized to JPEG before inference.
-2. PDFs are rendered to the first page and then classified.
-3. The response includes the normalized-artifact metadata.
+1. Image uploads are normalized to JPEG.
+2. PDF uploads are rendered to the first page and then normalized to JPEG.
+3. `best_car_model_v2.keras` returns `is_car`, `confidence`, `raw_score`, and `threshold_used`.
 
 Example:
 
@@ -209,62 +197,21 @@ Unified processing endpoint.
 Required form fields:
 
 1. `file`
-2. `process_type` with one of `car`, `mulkiya`, `pdf`, or `file`
+2. `process_type`: one of `car`, `mulkiya`, `pdf`, or `file`
 
 Optional form fields:
 
-1. `card_threshold` default `0.5`
-2. `ocr_lang` default `ar`
-3. `prefer_pdf_text` default `false`
-4. `skip_ocr` default `false`
-5. `translate_to_en` default `false`
+| Field | Default | Meaning |
+|---|---:|---|
+| `card_threshold` | `0.5` | Threshold for Mulkiya image card/not-card classification. |
+| `ocr_lang` | `ar` | PaddleOCR language. |
+| `prefer_pdf_text` | `false` | For PDFs, use embedded text when available before OCR. |
+| `skip_ocr` | `false` | For Mulkiya, stop after classification. |
+| `translate_to_en` | `false` | Add local dictionary-based English helper translation. |
 
 #### `process_type=car`
 
-1. Converts the input to a model-ready image.
-2. Runs the car classifier.
-3. Returns the car classification in `car_classification`.
-
-#### `process_type=mulkiya`
-
-1. Runs card vs not-card classification on the image form of the input.
-2. Runs OCR unless `skip_ocr=true`.
-3. If OCR succeeds, returns `raw_ocr`, `extracted_data`, and `rag_chunks`.
-4. If the structured Mulkiya JSON is created by the OCR pipeline, that structured artifact is used as the chunk source.
-
-For PDF uploads:
-
-1. The classifier portion is skipped because the code expects OCR for PDF Mulkiya inputs.
-2. The response sets the classification label to `unknown` and explains why.
-
-#### `process_type=pdf`
-
-1. Ensures the input is available as PDF.
-2. Runs OCR.
-3. Returns the OCR lines and chunked JSON output.
-
-If you pass an image, the API wraps it into a one-page PDF before OCR.
-
-#### `process_type=file`
-
-1. Does not run OCR.
-2. Returns metadata and a category-specific preview.
-3. Useful for inspecting arbitrary files before deciding which pipeline to use.
-
-Supported inspection categories include:
-
-1. Image
-2. PDF
-3. Text
-4. JSON
-5. Tabular files like CSV and TSV
-6. ZIP-based office formats like DOCX, XLSX, and PPTX
-7. XML
-8. Generic binary files
-
-#### Example requests
-
-Car:
+Normalizes the upload for image inference, calls `best_car_model_v2.keras`, and returns the result in `car_classification`.
 
 ```bat
 curl.exe -X POST "http://localhost:8000/api/v1/process" ^
@@ -272,7 +219,18 @@ curl.exe -X POST "http://localhost:8000/api/v1/process" ^
   -F "process_type=car"
 ```
 
-Mulkiya:
+#### `process_type=mulkiya`
+
+For image uploads:
+
+1. Normalize to JPEG.
+2. Run `card_noncard_classifier_model.keras`.
+3. If `skip_ocr=false`, normalize for OCR and run `ocr_simple_test.py`.
+4. Load `<stem>_ocr.json`.
+5. Load `<stem>_mulkya.json` when the extractor creates it.
+6. Build RAG chunks from the structured Mulkiya JSON, or from OCR lines as fallback.
+
+For PDF uploads, the card classifier is skipped because the current code expects OCR for PDF Mulkiya inputs. The classification label is set to `unknown`.
 
 ```bat
 curl.exe -X POST "http://localhost:8000/api/v1/process" ^
@@ -280,7 +238,7 @@ curl.exe -X POST "http://localhost:8000/api/v1/process" ^
   -F "process_type=mulkiya"
 ```
 
-Mulkiya without OCR:
+Skip OCR and return only the card/not-card result:
 
 ```bat
 curl.exe -X POST "http://localhost:8000/api/v1/process" ^
@@ -289,7 +247,11 @@ curl.exe -X POST "http://localhost:8000/api/v1/process" ^
   -F "skip_ocr=true"
 ```
 
-PDF OCR:
+#### `process_type=pdf`
+
+Ensures the input is a PDF, runs OCR or PDF text extraction, returns flattened lines, and builds RAG chunks.
+
+If an image is uploaded, the API wraps it into a one-page PDF before OCR.
 
 ```bat
 curl.exe -X POST "http://localhost:8000/api/v1/process" ^
@@ -298,7 +260,11 @@ curl.exe -X POST "http://localhost:8000/api/v1/process" ^
   -F "prefer_pdf_text=true"
 ```
 
-General file inspection:
+#### `process_type=file`
+
+Runs lightweight file inspection only. No OCR and no classifier are called.
+
+Supported inspection categories include image, PDF, text, JSON, CSV/TSV, ZIP-based Office files, XML, and generic binary files.
 
 ```bat
 curl.exe -X POST "http://localhost:8000/api/v1/process" ^
@@ -308,36 +274,35 @@ curl.exe -X POST "http://localhost:8000/api/v1/process" ^
 
 ### `POST /predict/damage`
 
-Damage detection endpoint for vehicle views.
+Vehicle damage and plate endpoint.
 
-Accepted fields:
+Accepted multipart fields:
 
 1. `front`
 2. `back`
 3. `left`
 4. `right`
 
-You must provide at least one view. The endpoint accepts up to four.
+At least one view is required. Up to four views can be submitted.
 
 Behavior:
 
-1. Each view is normalized to a JPEG model input.
-2. PDFs are rendered to the first page before classification.
-3. Stage 1 (EfficientNet-B2 binary model) runs on CPU through ONNX Runtime.
-4. `damage_detected=true` if any view is classified as damaged.
-5. `overall_confidence` is the highest confidence score among all submitted views.
-6. For each view where damage is detected, Stage 2 (YOLOv8n) runs automatically and populates a `damages` list with per-detection detail.
-7. If the YOLO model is not present, Stage 2 is skipped silently and `damages` is an empty list.
+1. Each submitted view is normalized to JPEG. PDFs are rendered to their first page.
+2. `damage_model.onnx` runs on every submitted view.
+3. If any view is damaged, the top-level `damage_detected` is `true`.
+4. For each damaged view, `damage_detector_v2.onnx` runs when available.
+5. YOLO outputs are enriched with severity, parts-at-risk, repair action, and replacement recommendation.
+6. If the YOLO model is missing or fails, the route still returns a binary damage result and falls back to a generic damage entry when needed.
+7. In parallel with damage inference, ANPR runs on the best available view by priority: `front`, `back`, `left`, then `right`.
 
-Each entry in `damages` contains:
+Damage classes:
 
-1. `type` — one of `car-part-crack`, `deformation`, `flat-tire`, `glass-crack`, `lamp-crack`, `scratches`
-2. `confidence` — YOLO detection confidence
-3. `severity` — `minor`, `moderate`, or `severe` (derived from bounding box area)
-4. `bbox` — normalized bounding box `[cx, cy, w, h]` in `[0, 1]`
-5. `parts_at_risk` — list of affected parts based on damage type and image region
-6. `repair_action` — recommended action string
-7. `replace` — boolean indicating whether replacement is recommended over repair
+1. `car-part-crack`
+2. `deformation`
+3. `flat-tire`
+4. `glass-crack`
+5. `lamp-crack`
+6. `scratches`
 
 Example:
 
@@ -349,107 +314,71 @@ curl.exe -X POST "http://localhost:8000/predict/damage" ^
   -F "right=@Samples\car_1007.jpg"
 ```
 
-## Response Shape
+## Unified Response Shape
 
-The unified endpoint returns a structured response with these common top-level fields:
+`/api/v1/process` returns these common top-level fields:
 
-1. `input`
-2. `classification`
-3. `car_classification`
-4. `confidence_score`
-5. `extracted_data`
-6. `raw_ocr`
-7. `rag_chunks`
-8. `artifacts`
-9. `note`
-10. `translation` when `translate_to_en=true`
+| Field | Meaning |
+|---|---|
+| `input` | Original filename, input kind, and normalization details. |
+| `classification` | Card/file/PDF classification data when applicable. |
+| `car_classification` | Car model result for car workflows. |
+| `confidence_score` | Main confidence value for the selected workflow. |
+| `extracted_data` | Structured extracted fields or file/OCR line data. |
+| `raw_ocr` | Raw OCR JSON payload when OCR ran. |
+| `rag_chunks` | Chunked text built from OCR or structured JSON. |
+| `artifacts` | Internal artifact paths such as the chunk source. |
+| `note` | Human-readable summary of what ran. |
+| `translation` | Present only when `translate_to_en=true`. |
 
-The `input.normalized` block tells you:
+## OCR And Mulkiya Extraction
 
-1. Which normalized file kind was used.
-2. The normalized MIME type.
-3. Whether conversion happened.
-4. Extra conversion details such as source format and PDF page selection.
+`poc_api.py` calls `ocr_simple_test.py` with:
 
-## Internal Data Flow
+1. `--write_text`
+2. `--no_images`
+3. `--lang <ocr_lang>`
+4. `--extract_mulkya` for Mulkiya OCR
+5. `--prefer_pdf_text` for PDF OCR when requested
 
-Here is the simplest way to understand the pipeline:
+For images, the script runs PaddleOCR directly and writes `<stem>_ocr.json`. For Mulkiya images, it also tries to write `<stem>_mulkya.json` using rule-based extraction. If Arabic OCR misses important fields, the script can run an auxiliary English OCR pass to improve extraction.
 
-1. The upload enters `poc_api.py`.
-2. The API checks the `process_type`.
-3. The file is normalized into the format needed by the next step.
-4. The model or OCR script runs.
-5. The API loads any generated JSON artifacts.
-6. The response is assembled with the original file context, inference result, and helpful metadata.
-
-For OCR-based paths, the API calls `ocr_simple_test.py` in a subprocess and then reads the JSON artifacts it writes next to the normalized input.
+For PDFs, `prefer_pdf_text=true` lets the script use the embedded PDF text layer when available. Otherwise, each page is rendered and passed through PaddleOCR.
 
 ## Translation Support
 
-`translate_to_en=true` does not call a remote translation service.
-
-Instead, the API uses a small local dictionary-based helper that:
-
-1. Translates known Mulkiya field names into English.
-2. Translates a set of common Arabic values.
-3. Leaves unknown text unchanged.
-
-This is useful for quick review, but it is not a full translation engine.
+`translate_to_en=true` uses a local dictionary helper in `poc_api.py`. It translates known Mulkiya labels and common Arabic values, and leaves unknown text unchanged. It does not call a remote translation API.
 
 ## RAG Chunking
 
-If a pipeline produces structured JSON, the API feeds that JSON into `rag_json_chunker.py`.
+Whenever a pipeline produces JSON suitable for chunking, `poc_api.py` calls `chunk_json_file()` from `rag_json_chunker.py`.
 
-The chunker:
-
-1. Flattens structured JSON into readable text lines.
-2. Splits OCR page text into overlapping chunks.
-3. Returns chunk metadata such as page number and chunk index.
-
-Default chunk settings used by the API:
+Default API chunk settings:
 
 1. `max_chars=1200`
 2. `overlap_lines=3`
+
+OCR documents are chunked page-by-page with overlap. Structured JSON is flattened into readable key/value lines and chunked without line overlap.
 
 ## Supporting Scripts
 
 ### `card_inference.py`
 
-This is a compact helper around the card vs not-card model.
-
-It supports:
-
-1. CLI inference on a single image path.
-2. A Tkinter GUI for manual testing.
-3. Model path overrides with `--model-path`.
-4. Threshold tuning with `--threshold`.
-5. Turning normalization off with `--no-normalize`.
-
-Example:
+Run the card/non-card model from the CLI:
 
 ```bat
 .\.venv\Scripts\python.exe card_inference.py --image Samples\Mulkiya_front.jpg
 ```
 
-### `ocr_simple_test.py`
+Useful options:
 
-This script is the OCR workhorse behind the unified API.
-
-The API uses it with:
-
-1. `--write_text`
-2. `--no_images`
-3. `--lang`
-4. `--extract_mulkya` when the Mulkiya pipeline needs structured extraction
-5. `--prefer_pdf_text` when PDF text should be preferred
-
-It writes OCR outputs as JSON files next to the input artifact so the API can load them afterward.
+1. `--model-path`
+2. `--threshold`
+3. `--no-normalize`
 
 ### `rag_json_chunker.py`
 
-This can be run on its own to turn OCR or structured JSON files into JSONL chunks.
-
-Example:
+Create JSONL chunks from OCR or structured JSON files:
 
 ```bat
 .\.venv\Scripts\python.exe rag_json_chunker.py Samples\ --output rag_chunks.jsonl
@@ -457,44 +386,17 @@ Example:
 
 ### `latency_analyzer.py`
 
-This script benchmarks the unified API with latency-focused metrics.
-
-It supports scenarios like:
-
-1. `health`
-2. `predict-car`
-3. `predict-damage`
-4. `process-car`
-5. `process-mulkiya`
-6. `process-pdf`
-7. `standalone-car`
-
-Useful flags:
-
-1. `--sample-format`
-2. `--random-sample-format`
-3. `--front-file`, `--back-file`, `--left-file`, `--right-file`
-4. `--mulkiya-skip-ocr`
-5. `--prefer-pdf-text`
-
-Example:
+Benchmark common routes:
 
 ```bat
 .\.venv\Scripts\python.exe latency_analyzer.py --scenario all --runs 5
 ```
 
+Supported scenarios include `health`, `predict-car`, `predict-damage`, `process-car`, `process-mulkiya`, `process-pdf`, and `standalone-car`.
+
 ### `benchmark_everything.py`
 
-This is a broader benchmark runner that reports more than latency alone.
-
-It can:
-
-1. Benchmark the unified routes.
-2. Optionally include the standalone car API.
-3. Save JSON and CSV output.
-4. Collect response-quality metrics such as confidence and OCR line counts.
-
-Example:
+Run broader benchmarks and save output:
 
 ```bat
 .\.venv\Scripts\python.exe benchmark_everything.py --save-results --include-standalone
@@ -502,74 +404,67 @@ Example:
 
 ## Sample Data
 
-The `Samples/` folder contains files that are useful for testing each pipeline:
+Useful sample files:
 
-1. `Samples/car_10.jpg`, `Samples/car_1001.jpg`, `Samples/car_1003.jpg`, `Samples/car_1005.jpg`, `Samples/car_1007.jpg`
-2. `Samples/Mulkiya_front.jpg`, `Samples/Mulkiya_back.jpg`
-3. `Samples/Non_card_image_1.jpeg`, `Samples/Non_card_image_2.jpeg`
-4. `Samples/sample_pdf.pdf`
-5. `Samples/converted/` for alternate image formats used in benchmarking
+1. Car images: `Samples/car_10.jpg`, `Samples/car_1001.jpg`, `Samples/car_1003.jpg`, `Samples/car_1005.jpg`, `Samples/car_1007.jpg`
+2. Mulkiya images: `Samples/Mulkiya_front.jpg`, `Samples/Mulkiya_back.jpg`
+3. Non-card examples: `Samples/Non_card_image_1.jpeg`, `Samples/Non_card_image_2.jpeg`
+4. PDF: `Samples/sample_pdf.pdf`
+5. Format-conversion samples: `Samples/converted/`
 
-## Common Troubleshooting
+## Troubleshooting
 
 ### `415 Unsupported Media Type` or conversion errors
 
-This usually means the uploaded file could not be converted to the format required by the chosen pipeline.
+The upload could not be converted into the format needed by the selected pipeline. Check that the file is a valid image/PDF for model or OCR workflows.
 
-Common causes:
+### OCR failures
 
-1. Unsupported binary files sent to `car`, `mulkiya`, `pdf`, or `damage` routes.
-2. Corrupt image files.
-3. Missing PDF conversion dependencies.
-
-### OCR failure
-
-If OCR fails, check:
+Check:
 
 1. `UPSURE_OCR_PYTHON`
-2. The OCR environment itself
-3. Whether PaddleOCR and its dependencies are installed in that environment
+2. PaddleOCR installation in the selected interpreter
+3. PyMuPDF installation for PDF inputs
+4. Whether the OCR subprocess error in the API response points to a missing package or model
 
 ### Damage model not ready
 
-If `/health` reports `damage_model_ready=false`, check:
+Check:
 
-1. That `models/damage_model.onnx` exists.
-2. That any external data file required by the ONNX export exists next to it.
-3. That `UPSURE_DAMAGE_MODEL` is not pointing to the wrong file.
+1. `models/damage_model.onnx` exists, or `UPSURE_DAMAGE_MODEL` points to a valid ONNX file.
+2. Any required `.onnx.data` companion file is next to the model.
+3. ONNX Runtime is installed.
 
-### YOLO damage-type model not ready
+### YOLO damage model not ready
 
-If `/health` reports `yolo_model_ready=false`, check:
+Check:
 
-1. That `models/damage_detector_v2.onnx` exists.
-2. That `UPSURE_YOLO_MODEL` is not pointing to the wrong file.
+1. `models/damage_detector_v2.onnx` exists, or `UPSURE_YOLO_MODEL` points to a valid ONNX file.
+2. ONNX Runtime can load the file.
 
-Note: the YOLO model missing is non-fatal. The `/predict/damage` endpoint still runs Stage 1 and returns binary results. The `damages` field will be an empty list for all views.
+The damage route can still return Stage 1 binary damage results if the YOLO damage model is missing.
+
+### ANPR not available
+
+Check:
+
+1. `plate_pipeline.py` imports successfully.
+2. `models/anpr_plate_detector/` exists.
+3. TensorFlow and PaddleOCR are installed in the API environment.
 
 ### Car model load failure
 
-If car inference fails, confirm:
+Check:
 
 1. `models/best_car_model_v2.keras` exists.
 2. TensorFlow or Keras is installed.
-3. The file is not corrupted.
-
-## Important Notes
-
-1. The unified API uses `process_type` to choose the workflow.
-2. `process_type=mulkiya` supports `skip_ocr=true`.
-3. `process_type=file` is intended for inspection, not inference.
-4. The API adds an `X-Process-Time-ms` response header on every request.
-5. Model artifacts are expected to be downloaded locally and are not meant to be committed.
+3. The model file is not corrupted.
 
 ## Quick Start
 
-If you just want the shortest path to a working setup:
-
 1. Create and activate `.venv`.
 2. Run `pip install -r requirements.txt`.
-3. Download the model files into `models/`.
-4. Set `UPSURE_OCR_PYTHON` if your OCR interpreter lives elsewhere.
-5. Start the unified API on port `8000`.
-6. Test with one of the sample files in `Samples/`.
+3. Put model artifacts in `models/`.
+4. Set `UPSURE_OCR_PYTHON` if OCR uses a separate environment.
+5. Start `poc_api.py` on port `8000`.
+6. Test with a file from `Samples/`.

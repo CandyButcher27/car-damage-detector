@@ -51,7 +51,7 @@ try:
     from keras.models import load_model as load_keras_model
 except ImportError:
     try:
-        from tensorflow.keras.models import load_model as load_keras_model
+        from tensorflow.keras.models import load_model as load_keras_model # type: ignore
     except ImportError:
         load_keras_model = None
 
