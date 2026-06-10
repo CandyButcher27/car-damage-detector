@@ -122,6 +122,8 @@ def _get_annotation_font(font_size: int):
     from PIL import ImageFont
 
     font_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
         r"C:\Windows\Fonts\tahoma.ttf",
         r"C:\Windows\Fonts\arial.ttf",
         r"C:\Windows\Fonts\calibri.ttf",

@@ -1,31 +1,59 @@
-# You can override the included template(s) by including variable overrides
-# SAST customization: https://docs.gitlab.com/ee/user/application_security/sast/#customizing-the-sast-settings
-# Secret Detection customization: https://docs.gitlab.com/user/application_security/secret_detection/pipeline/configure
-# Dependency Scanning customization: https://docs.gitlab.com/ee/user/application_security/dependency_scanning/#customizing-the-dependency-scanning-settings
-# Container Scanning customization: https://docs.gitlab.com/ee/user/application_security/container_scanning/#customizing-the-container-scanning-settings
-# Note that environment variables can be set in several places
-# See https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
-stages:
-- build
-- test
-- deploy
-- review
-- dast
-- staging
-- canary
-- production
-- incremental rollout 10%
-- incremental rollout 25%
-- incremental rollout 50%
-- incremental rollout 100%
-- performance
-- cleanup
-- secret-detection
-sast:
-  stage: test
-include:
-- template: Auto-DevOps.gitlab-ci.yml
+image: asia.gcr.io/inbox-gcr/devops/builder:mvn-sbt-node
+
 variables:
+  KONG_DOMAIN: k8s.insuranceinbox.com
+  DOCKER_REGISTRY: asia.gcr.io/inbox-gcr/projects
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
   SECRET_DETECTION_ENABLED: 'true'
-secret_detection:
-  stage: secret-detection
+
+include:
+  - template: Auto-DevOps.gitlab-ci.yml
+
+stages:
+  - sast
+  - test
+  - secret-detection
+  - qc_test
+  - sonar
+  - build
+  - security_scan
+  - review
+  - dast
+  - staging
+  - canary
+  # - production
+  # - incremental rollout 10%
+  # - incremental rollout 25%
+  # - incremental rollout 50%
+  # - incremental rollout 100%
+  - performance
+  - deploy
+  - cleanup
+
+.bootstrap: &bootstrap
+  before_script:
+    - echo "🔐 Logging in to GCR..."
+    - docker login -u _json_key -p "$INBOX_GCR_ACCESS_KEY" https://asia.gcr.io
+  after_script:
+    - docker system prune -af --volumes
+
+# sast:
+#   stage: test
+
+# secret_detection:
+#   stage: secret-detection
+
+build:
+  <<: *bootstrap
+  image: asia.gcr.io/inbox-gcr/devops/builder:mvn-sbt-node
+  tags:
+    - docker
+  stage: build
+  script:
+    - echo "Building Docker image for pipeline ${CI_PIPELINE_ID}"
+    - docker builder prune -af || true
+    - docker build --no-cache -t "${DOCKER_REGISTRY}/data-ingestion:${CI_PIPELINE_ID}" -f Dockerfile .
+    - docker push "${DOCKER_REGISTRY}/data-ingestion:${CI_PIPELINE_ID}"
+  only:
+    - backup-jun10
