@@ -1,0 +1,43 @@
+# Local docker-compose for end-to-end smoke testing.
+#
+#   docker compose up --build
+#   curl http://localhost:8000/livez
+#
+# Models are mounted from the host so the image stays small.
+version: "3.9"
+
+services:
+  data-ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: upsure/data-ingestion:dev
+    container_name: upsure-data-ingestion
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.example
+    environment:
+      UPSURE_ENV: development
+      UPSURE_LOG_JSON: "false"
+      UPSURE_PRELOAD_MODELS: "false"
+      UPSURE_REQUIRE_MODELS_FOR_READY: "false"
+      # Override paths if your local model artefacts use the digiLifeDoc_* names.
+      # UPSURE_DAMAGE_MODEL: /app/models/digiLifeDoc_damage_model.onnx
+      # UPSURE_YOLO_MODEL:   /app/models/digiLifeDoc_damage_detector_v2.onnx
+    volumes:
+      - ./models:/app/models:ro
+      - ./Samples:/app/Samples:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/livez"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+    restart: unless-stopped

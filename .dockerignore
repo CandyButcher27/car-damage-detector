@@ -1,0 +1,66 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Local virtual environments
+.venv
+venv
+env
+
+# Editor / IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Python caches
+__pycache__
+**/__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+.tox
+
+# Build artefacts
+dist
+build
+*.egg-info
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints
+
+# Test fixtures & samples — keep image bytes out of the image; mount via volume
+Samples/
+tests/
+benchmark_everything.py
+latency_analyzer.py
+
+# Local results & artefacts
+*.jsonl
+*.csv
+*.log
+
+# Pipeline diagrams / docs
+*.png
+*.pdf
+*.md
+!README.md
+
+# Model artefacts ship via a separate volume / OCI artefact mount.
+models/
+*.onnx
+*.onnx.data
+*.keras
+*.h5
+
+# Local secrets
+.env
+.env.*
+!.env.example
+secrets/

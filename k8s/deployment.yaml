@@ -1,0 +1,268 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-ingestion
+  labels:
+    app.kubernetes.io/name: data-ingestion
+    app.kubernetes.io/part-of: upsure
+    app.kubernetes.io/version: "1.1.0"
+spec:
+  # Single replica per user direction — resource-constrained environment, no HA.
+  # k8s still restarts the pod automatically on crash; clients see brief 503s
+  # during restarts which the envelope's `retryable: true` covers.
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-ingestion
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: data-ingestion
+        app.kubernetes.io/part-of: upsure
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: data-ingestion
+      # Set to true if you wire Workload Identity for the GCS init container;
+      # without GCS, this can stay false.
+      automountServiceAccountToken: false
+      securityContext:
+        # `runAsNonRoot: true` is enforced per-container below (on the API
+        # container). The init container needs root to apk-install curl;
+        # k8s rejects the pod if `runAsNonRoot` is set pod-wide while an
+        # init container sets `runAsUser: 0`.
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 40
+
+      # ── initContainers ───────────────────────────────────────────────────
+      # Pull model artefacts over HTTPS into an emptyDir before the API
+      # container starts. Pod restart = re-pull, so no PVC drift and the
+      # deployment stays stateless.
+      #
+      # Wire-up:
+      #   * Set UPSURE_MODELS_BASE_URL in the ConfigMap (e.g.
+      #     https://storage.googleapis.com/cdn_gcpupsure).
+      #   * For an anonymous-readable bucket no further config is needed.
+      #   * For an auth-required bucket, mount a Secret named
+      #     `data-ingestion-models-token` with key `token` containing a
+      #     bearer token (e.g. a short-lived GCS access token) and the
+      #     init container will send `Authorization: Bearer $TOKEN`.
+      #
+      # Each file is downloaded individually; on success the API container
+      # starts. If any file fails, the init container exits non-zero and
+      # the pod stays in `Init:Error` (good for visibility).
+      initContainers:
+        - name: model-sync
+          image: alpine:3.20
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache curl ca-certificates >/dev/null
+
+              BASE="${UPSURE_MODELS_BASE_URL:-}"
+              if [ -z "$BASE" ]; then
+                echo "UPSURE_MODELS_BASE_URL is empty — assuming models are already on the volume."
+                ls -la /models || true
+                exit 0
+              fi
+
+              AUTH_HEADER=""
+              if [ -f /var/run/secrets/models-token/token ]; then
+                TOKEN=$(cat /var/run/secrets/models-token/token)
+                AUTH_HEADER="-H Authorization: Bearer ${TOKEN}"
+              fi
+
+              for spec in \
+                  "${UPSURE_DAMAGE_MODEL_FILE:-digiLifeDoc_damage_model.onnx}" \
+                  "${UPSURE_YOLO_MODEL_FILE:-digiLifeDoc_damage_detector_v2.onnx}" \
+                  "${UPSURE_CAR_MODEL_FILE:-digiLifeDoc_best_car_model_v2.onnx}" ; do
+                if [ -f "/models/$spec" ]; then
+                  echo "[skip] $spec already present"
+                  continue
+                fi
+                echo "[fetch] $spec from $BASE"
+                # shellcheck disable=SC2086
+                curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+                     --connect-timeout 10 --max-time 600 \
+                     $AUTH_HEADER \
+                     --output "/models/$spec" \
+                     "${BASE}/${spec}"
+              done
+
+              echo "Model sync complete. Contents of /models:"
+              ls -la /models
+          env:
+            - name: UPSURE_MODELS_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: data-ingestion-config
+                  key: UPSURE_MODELS_BASE_URL
+                  optional: true
+            - name: UPSURE_DAMAGE_MODEL_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: data-ingestion-config
+                  key: UPSURE_DAMAGE_MODEL_FILE
+                  optional: true
+            - name: UPSURE_YOLO_MODEL_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: data-ingestion-config
+                  key: UPSURE_YOLO_MODEL_FILE
+                  optional: true
+            - name: UPSURE_CAR_MODEL_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: data-ingestion-config
+                  key: UPSURE_CAR_MODEL_FILE
+                  optional: true
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            # Optional bearer-token mount. Create with:
+            #   kubectl create secret generic data-ingestion-models-token \
+            #     --from-literal=token="$(gcloud auth print-access-token)"
+            # then uncomment the volume + the volumeMount below.
+            # - name: models-token
+            #   mountPath: /var/run/secrets/models-token
+            #   readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            # Alpine needs root to apk-install curl. The container exits
+            # before the API container starts, and the only thing it touches
+            # is the emptyDir volume, so the blast radius is minimal.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+              # NET_BIND_SERVICE not needed — outbound only.
+
+      containers:
+        - name: api
+          image: registry.upsure.io/ai-cohort/data-ingestion:1.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: data-ingestion-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60        # 5 minutes window for cold start
+
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "5Gi"
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: app-tmp
+              mountPath: /app/.cache
+            # PaddleOCR / PaddleX writable cache.
+            - name: paddle-cache
+              mountPath: /home/upsure
+
+          lifecycle:
+            preStop:
+              exec:
+                # Give the LB a chance to remove the pod before we stop accepting traffic.
+                command: ["/bin/sh", "-c", "sleep 10"]
+
+      volumes:
+        # emptyDir so the init container can write and the API container can
+        # read. No PVC required — fully stateless.
+        - name: models
+          emptyDir:
+            sizeLimit: 5Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: app-tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: paddle-cache
+          emptyDir:
+            sizeLimit: 512Mi
+        # Uncomment if you mount a bearer token for the model bucket.
+        # - name: models-token
+        #   secret:
+        #     secretName: data-ingestion-models-token
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: data-ingestion
+  labels:
+    app.kubernetes.io/name: data-ingestion
+    app.kubernetes.io/part-of: upsure
+  # When using GCP Workload Identity, set:
+  #   iam.gke.io/gcp-service-account: data-ingestion@PROJECT.iam.gserviceaccount.com
+automountServiceAccountToken: false
