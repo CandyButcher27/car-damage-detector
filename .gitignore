@@ -1,5 +1,6 @@
 .venv/
 .antigravitycli
 __pycache__/
-models/*
 venv/
+models/*.onnx
+
