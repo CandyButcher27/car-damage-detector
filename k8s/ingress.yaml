@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: data-ingestion-ingress
+  namespace: tameen
+  annotations:
+    nginx.ingress.kubernetes.io/enable-access-log: "true"
+    # Allow large file uploads (25 MiB = same as UPSURE_MAX_UPLOAD_BYTES)
+    nginx.ingress.kubernetes.io/proxy-body-size: "30m"
+    # Upstream timeouts — match UPSURE_REQUEST_TIMEOUT_SECONDS (120s)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ocr.tameen.om
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: data-ingestion
+                port:
+                  number: 80

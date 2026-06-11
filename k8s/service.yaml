@@ -1,16 +1,32 @@
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: data-ingestion
+#   labels:
+#     app.kubernetes.io/name: data-ingestion
+#     app.kubernetes.io/part-of: upsure
+# spec:
+#   type: ClusterIP
+#   selector:
+#     app.kubernetes.io/name: data-ingestion
+#   ports:
+#     - name: http
+#       port: 80
+#       targetPort: http
+#       protocol: TCP
+
 apiVersion: v1
 kind: Service
 metadata:
   name: data-ingestion
+  namespace: tameen
   labels:
-    app.kubernetes.io/name: data-ingestion
-    app.kubernetes.io/part-of: upsure
+    app: data-ingestion
 spec:
-  type: ClusterIP
   selector:
-    app.kubernetes.io/name: data-ingestion
+    app: data-ingestion
   ports:
-    - name: http
+    - protocol: TCP
       port: 80
-      targetPort: http
-      protocol: TCP
+      targetPort: 8000
+  type: ClusterIP
