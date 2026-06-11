@@ -1,8 +1,14 @@
-# UpSure Combined PoC
+# UpSure data-ingestion
 
-FastAPI proof of concept for vehicle, Mulkiya, OCR, file-inspection, damage-analysis, and ANPR workflows.
+FastAPI service for vehicle, Mulkiya, OCR, file-inspection, damage-analysis, and ANPR workflows.
 
-The main service is `poc_api.py`. It accepts uploads, normalizes each file into the format required by the selected pipeline, runs the appropriate model or OCR process, and returns a structured JSON response. `car_classifier_api.py` is a smaller standalone car-classifier service kept for compatibility and quick smoke tests.
+The main service is `poc_api.py`. It accepts uploads, normalizes each file into the format required by the selected pipeline, runs the appropriate model or OCR process, and returns a structured JSON response.
+
+> **Production note** — every endpoint now returns a unified envelope
+> (`{success, data, error, meta}`), runs behind a request-id middleware,
+> exports Prometheus metrics on `/metrics`, exposes `/livez` and `/readyz`
+> k8s probes, and protects downstream OCR/ANPR/YOLO calls with circuit
+> breakers. See [Production Deployment](#production-deployment) below.
 
 ## What The Project Does
 
@@ -22,7 +28,8 @@ The main service is `poc_api.py`. It accepts uploads, normalizes each file into 
 | File | Purpose |
 |---|---|
 | `poc_api.py` | Main FastAPI app. Owns routing, normalization, OCR orchestration, model calls, damage flow, ANPR integration, and response assembly. |
-| `car_classifier_api.py` | Standalone car-classifier API using `best_car_model_v2.keras`. |
+| `onnx_inference.py` | Generic `BinaryOnnxImageClassifier` + `YoloOnnxDetector` used by the car / damage paths. |
+| `app/` | Cross-cutting concerns: settings, structured logging, observability, resilience patterns, error taxonomy, response envelope, k8s health probes. |
 | `card_inference.py` | Lightweight NumPy/HDF5 loader for the card vs not-card Keras model. |
 | `ocr_simple_test.py` | OCR worker script called by `poc_api.py` in a subprocess. Produces OCR JSON and optional Mulkiya JSON. |
 | `plate_pipeline.py` | ANPR pipeline: plate detection with YOLOv4 TensorFlow SavedModel and plate OCR with PaddleOCR. |
@@ -37,13 +44,16 @@ The main service is `poc_api.py`. It accepts uploads, normalizes each file into 
 ```text
 .
 |-- poc_api.py
-|-- car_classifier_api.py
+|-- onnx_inference.py
 |-- card_inference.py
 |-- ocr_simple_test.py
 |-- plate_pipeline.py
 |-- rag_json_chunker.py
 |-- latency_analyzer.py
 |-- benchmark_everything.py
+|-- app/                   # cross-cutting concerns (envelope, logging, resilience)
+|-- k8s/                   # production deployment manifests
+|-- Dockerfile
 |-- requirements.txt
 |-- README.md
 |-- models/
@@ -58,14 +68,13 @@ The main service is `poc_api.py`. It accepts uploads, normalizes each file into 
 
 | Route or workflow | Model sequence |
 |---|---|
-| `/predict/` | `best_car_model_v2.keras` |
-| `/api/v1/process`, `process_type=car` | `best_car_model_v2.keras` |
+| `/predict/` | `best_car_model_v2.onnx` (auto-detects `.keras` fallback) via `BinaryOnnxImageClassifier` |
+| `/api/v1/process`, `process_type=car` | Same car classifier as `/predict/` |
 | `/api/v1/process`, `process_type=mulkiya`, image input | `card_noncard_classifier_model.keras` -> if `skip_ocr=false`: `PaddleOCR` -> rule-based Mulkiya extraction -> RAG chunking |
 | `/api/v1/process`, `process_type=mulkiya`, PDF input | Card classifier is skipped -> if `skip_ocr=false`: PDF text layer or `PaddleOCR` -> rule-based extraction -> RAG chunking |
 | `/api/v1/process`, `process_type=pdf` | PDF text layer when `prefer_pdf_text=true` and text exists, otherwise `PaddleOCR` -> RAG chunking |
 | `/api/v1/process`, `process_type=file` | No ML model. File inspection only, then JSON chunking. |
-| `/predict/damage` | Per submitted view: `damage_model.onnx` -> if damaged and YOLO model exists: `damage_detector_v2.onnx`. In parallel, one selected view runs ANPR: YOLOv4 plate detector -> PaddleOCR plate OCR. |
-| `car_classifier_api.py` standalone service | Loads `best_car_model_v2.keras` at startup, then reuses it for `/predict/`. |
+| `/predict/damage` | Single batched ONNX call across submitted views via `damage_model.onnx`; for each damaged view also runs `damage_detector_v2.onnx`. In parallel, one selected view runs ANPR: YOLOv4 plate detector -> PaddleOCR plate OCR. |
 
 Models in `poc_api.py` are lazy-loaded. The first request that needs a model loads it into memory; later requests reuse the cached model/session.
 
@@ -75,10 +84,10 @@ Place model files in `models/` before starting the services.
 
 | Model artifact | Used by |
 |---|---|
-| `best_car_model_v2.keras` | Car classification in `/predict/`, `/api/v1/process` with `process_type=car`, and the standalone car service. |
+| `best_car_model_v2.onnx` / `digiLifeDoc_best_car_model_v2.onnx` | Car classification in `/predict/` and `/api/v1/process` with `process_type=car`. ONNX path is preferred; `.keras` is auto-detected as fallback. |
 | `card_noncard_classifier_model.keras` | Mulkiya card vs not-card classification for image uploads. The loader also accepts the legacy filename `card_noncard_model.keras`. |
-| `damage_model.onnx` | Stage 1 binary damage classification for `/predict/damage`. Fallback filename: `digiLifeDoc_damage_model.onnx`. |
-| `damage_detector_v2.onnx` | Stage 2 YOLO damage-type/localization model for `/predict/damage`. Fallback filename: `damage_detector.onnx`. |
+| `damage_model.onnx` / `digiLifeDoc_damage_model.onnx` | Stage 1 binary damage classification for `/predict/damage`. |
+| `damage_detector_v2.onnx` / `digiLifeDoc_damage_detector_v2.onnx` | Stage 2 YOLO damage-type/localization model. Fallback filename: `damage_detector.onnx`. |
 | `models/anpr_plate_detector/` | TensorFlow SavedModel used by `plate_pipeline.py` for license-plate detection. |
 | `mulkiya_classifier_model.keras` | Legacy artifact. It is present in some setups but is not the default model used by the current loader. |
 
@@ -86,11 +95,10 @@ Expected local contents:
 
 ```text
 models/
-|-- best_car_model_v2.keras
+|-- digiLifeDoc_best_car_model_v2.onnx       (or best_car_model_v2.onnx)
 |-- card_noncard_classifier_model.keras
-|-- damage_model.onnx
-|-- damage_detector_v2.onnx
-|-- mulkiya_classifier_model.keras
+|-- digiLifeDoc_damage_model.onnx            (or damage_model.onnx)
+|-- digiLifeDoc_damage_detector_v2.onnx      (or damage_detector_v2.onnx)
 `-- anpr_plate_detector/
 ```
 
@@ -141,17 +149,13 @@ Then download or copy the required model artifacts into `models/`.
 
 ## Run The Services
 
-Unified API, recommended for most testing:
+Unified API:
 
 ```bat
 .\.venv\Scripts\python.exe -m uvicorn poc_api:app --host 0.0.0.0 --port 8000
 ```
 
-Standalone car classifier:
-
-```bat
-.\.venv\Scripts\python.exe -m uvicorn car_classifier_api:app --host 0.0.0.0 --port 8001
-```
+For production, prefer the Docker image — see [Production Deployment](#production-deployment).
 
 ## API Reference
 
@@ -468,3 +472,99 @@ Check:
 4. Set `UPSURE_OCR_PYTHON` if OCR uses a separate environment.
 5. Start `poc_api.py` on port `8000`.
 6. Test with a file from `Samples/`.
+
+## Production Deployment
+
+### Response envelope
+
+Every endpoint returns:
+
+```json
+{
+  "success": true,
+  "data":    { ... endpoint-specific payload ... },
+  "error":   null,
+  "meta": {
+    "request_id":      "9d39c5...",
+    "endpoint":        "/predict/damage",
+    "api_version":     "v1",
+    "service_version": "1.1.0",
+    "latency_ms":      234.12,
+    "timestamp":       "2026-06-11T12:34:56Z"
+  }
+}
+```
+
+On failure, `success=false`, `data=null`, and `error` carries:
+
+```json
+{
+  "code":      "MODEL_UNAVAILABLE",
+  "message":   "Required model or resource was not found on the server.",
+  "retryable": true,
+  "details":   { ... optional ... }
+}
+```
+
+Error codes: `VALIDATION_ERROR`, `UNSUPPORTED_MEDIA`, `PAYLOAD_TOO_LARGE`,
+`NOT_FOUND`, `MODEL_UNAVAILABLE`, `CIRCUIT_OPEN`, `DEPENDENCY_TIMEOUT`,
+`PIPELINE_FAILURE`, `INTERNAL_ERROR`.
+
+### Health probes
+
+| Path      | Purpose                                              |
+| --------- | ---------------------------------------------------- |
+| `/livez`  | k8s liveness — always 200 if the process is alive   |
+| `/readyz` | k8s readiness — 200 only when critical models loaded |
+| `/health` | full component snapshot (legacy)                     |
+| `/metrics`| Prometheus scrape                                    |
+
+### Observability
+
+* JSON-line structured logs (set `UPSURE_LOG_JSON=false` for human format).
+* Every request gets a `request_id` (inbound `X-Request-ID` honoured or
+  generated) propagated through logs and response headers.
+* Prometheus collectors: `upsure_http_requests_total`,
+  `upsure_http_request_duration_seconds`,
+  `upsure_pipeline_duration_seconds`,
+  `upsure_model_ready`, `upsure_circuit_state`.
+
+### Resilience patterns
+
+* **Circuit breakers** wrap each downstream — `damage_binary`,
+  `yolo_damage`, `anpr_pipeline`, `ocr_subprocess`. After
+  `UPSURE_CB_FAILURE_THRESHOLD` consecutive failures the breaker opens for
+  `UPSURE_CB_RECOVERY_SECONDS`; one probe call is allowed in half-open.
+* **Retry with backoff** on model load at startup (capped exponential + jitter).
+* **Subprocess timeout** on the OCR helper (`UPSURE_OCR_SUBPROCESS_TIMEOUT_SECONDS`).
+* **Bulkheads** bound concurrent damage and OCR pipelines so one workload
+  cannot starve the other.
+* **Upload guard** rejects `Content-Length > UPSURE_MAX_UPLOAD_BYTES`
+  before any framework buffering happens.
+
+### Configuration
+
+All knobs are env-driven; see [.env.example](.env.example).
+
+### Docker
+
+```bash
+docker build -t upsure/data-ingestion:1.1.0 .
+docker compose up --build         # local with model volume mounted
+```
+
+Image runs as UID 10001, read-only root filesystem when run via the k8s
+manifests, with `tini` reaping the OCR subprocess.
+
+### Kubernetes
+
+Manifests live in [`k8s/`](k8s/):
+
+```bash
+kubectl apply -f k8s/
+```
+
+`Deployment` uses startup / liveness / readiness probes pointed at
+`/livez` and `/readyz`, defines CPU/memory requests + limits, mounts
+models from a `PersistentVolumeClaim`, and is paired with a `HPA`
+(autoscaling/v2) and `PodDisruptionBudget`. See [k8s/README.md](k8s/README.md).

@@ -25,7 +25,7 @@ Health check: `GET http://localhost:8000/health`
 |----------|---------|-------|
 | `damage_model.onnx` | binary car damage detector (EfficientNet-B2) | 31MB self-contained — MUST be single-file export, NOT split |
 | `damage_detector_v2.onnx` | YOLO damage localizer (6 classes) | production model, mAP50=0.672 |
-| `best_car_model_v2.keras` | car binary classifier | used for car/non-car gating |
+| `best_car_model_v2.onnx` (or `digiLifeDoc_best_car_model_v2.onnx`) | car binary classifier | ONNX preferred (see `onnx_inference.BinaryOnnxImageClassifier`); `.keras` is auto-detected as fallback |
 | `card_noncard_classifier_model.keras` | card/non-card classifier | used by card_inference.py |
 | `anpr_plate_detector/` | YOLOv4 TF SavedModel for license plate detection | SavedModel dir: saved_model.pb + variables/ |
 
@@ -34,11 +34,16 @@ A split export (~736KB + `.data` companion) will fail with:
 `"ONNX Runtime expects a companion external-data file next to damage_model.onnx: damage_model.onnx.data"`
 
 ## Endpoints
-- `GET /health` — model load status for all models incl. ANPR
-- `POST /predict/damage` — multipart form, fields: `front`, `back`, `left`, `right` (all optional UploadFile)
-- `POST /predict/car` — car damage binary prediction
-- `POST /predict/card` — card/non-card classification
-- `POST /process` — general document processing (OCR, PDF, etc.)
+- `GET /livez` — k8s liveness (always 200 if alive)
+- `GET /readyz` — k8s readiness (200 only when critical models loaded)
+- `GET /health` — full component snapshot (legacy)
+- `GET /metrics` — Prometheus scrape
+- `POST /predict/` — direct car classification
+- `POST /predict/damage` — multipart, fields `front` / `back` / `left` / `right` (UploadFile, optional, ≥1 required)
+- `POST /api/v1/process` — unified processing, `process_type` ∈ `car` / `mulkiya` / `pdf` / `file`
+
+All responses use the envelope `{ success, data, error, meta }`. Tests in
+`tests/test_backend.py` use the `ok()` / `err()` helpers to dig in.
 
 ## Damage + ANPR Pipeline (`/predict/damage`)
 Damage and ANPR run **in parallel** using `asyncio.gather` + `run_in_threadpool`.

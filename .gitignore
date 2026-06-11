@@ -1,4 +1,50 @@
+# Local dev
 .venv/
+venv/
+env/
 .antigravitycli
+
+# Python caches
 __pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model artefacts ship via mount / init container; never commit them.
 models/*
+!models/.gitkeep
+*.onnx
+*.onnx.data
+*.keras
+*.h5
+*.savedmodel/
+
+# Sample-derived artefacts produced by the OCR / damage pipelines
+Samples/*_ocr.json
+Samples/*_mulkya.json
+Samples/converted/
+
+# Build / runtime artefacts
+docker-build.log
+reports/
+*.log
+
+# Local environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
