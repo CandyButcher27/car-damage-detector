@@ -29,7 +29,7 @@ build:
     - docker build --no-cache -t "${DOCKER_REGISTRY}/data-ingestion:${CI_PIPELINE_ID}" -f Dockerfile .
     - docker push "${DOCKER_REGISTRY}/data-ingestion:${CI_PIPELINE_ID}"
   rules:
-    - if: '$CI_COMMIT_BRANCH == "vddfinal-deploy"'
+    - if: '$CI_COMMIT_BRANCH == "vddfinal-deploy-intern"'
 
 deploy:
   extends: .bootstrap
@@ -41,4 +41,4 @@ deploy:
     - echo "Deploying Docker image for pipeline ${CI_PIPELINE_ID}"
     - kubectl set image deployment/data-ingestion data-ingestion="${DOCKER_REGISTRY}/data-ingestion:${CI_PIPELINE_ID}" -n staging
   rules:
-    - if: '$CI_COMMIT_BRANCH == "vddfinal-deploy"'
+    - if: '$CI_COMMIT_BRANCH == "vddfinal-deploy-intern"'
