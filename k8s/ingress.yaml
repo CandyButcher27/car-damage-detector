@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: data-ingestion-ingress
-  namespace: tameen
+  namespace: staging
   annotations:
     nginx.ingress.kubernetes.io/enable-access-log: "true"
     # Allow large file uploads (25 MiB = same as UPSURE_MAX_UPLOAD_BYTES)

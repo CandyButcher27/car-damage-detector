@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: data-ingestion
-  namespace: tameen
+  namespace: staging
   labels:
     app: data-ingestion
 spec:
@@ -29,19 +29,87 @@ spec:
       imagePullSecrets:
         - name: dockerauth
       terminationGracePeriodSeconds: 40
+
+      # ── Init container: download model files from GCS before app starts ──
+      # Set UPSURE_MODELS_BASE_URL in configmap to your GCS public/CDN URL.
+      # e.g. https://storage.googleapis.com/cdn_gcpupsure
+      # If empty, init exits cleanly and expects models already on the volume.
+      initContainers:
+        - name: model-sync
+          image: alpine:3.20
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache curl ca-certificates >/dev/null
+
+              BASE="${UPSURE_MODELS_BASE_URL:-}"
+              if [ -z "$BASE" ]; then
+                echo "UPSURE_MODELS_BASE_URL not set — skipping model download."
+                ls -la /app/models || true
+                exit 0
+              fi
+
+              echo "Downloading models from: $BASE"
+
+              download_if_missing() {
+                FILENAME="$1"
+                DEST="/app/models/${FILENAME}"
+                if [ -f "$DEST" ]; then
+                  echo "[skip] $FILENAME already present"
+                  return
+                fi
+                echo "[fetch] $FILENAME"
+                curl --fail --silent --show-error --location \
+                     --retry 3 --retry-delay 5 \
+                     --connect-timeout 15 --max-time 600 \
+                     --output "$DEST" \
+                     "${BASE}/${FILENAME}"
+                echo "[done] $FILENAME ($(du -sh $DEST | cut -f1))"
+              }
+
+              download_if_missing "damage_model.onnx"
+              download_if_missing "damage_detector_v2.onnx"
+              download_if_missing "best_car_model_v2.onnx"
+              download_if_missing "card_noncard_classifier_model.keras"
+
+              echo "All models ready:"
+              ls -lh /app/models/
+          env:
+            - name: UPSURE_MODELS_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: data-ingestion-config
+                  key: UPSURE_MODELS_BASE_URL
+                  optional: true
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+
       containers:
         - name: data-ingestion
-          image: asia.gcr.io/inbox-gcr/projects/data-ingestion:9943
+          image: asia.gcr.io/inbox-gcr/projects/data-ingestion:9945
           imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8000
               protocol: TCP
-          # Load all non-secret config from ConfigMap
           envFrom:
             - configMapRef:
                 name: data-ingestion-config
-          # Expose pod metadata to the app for structured logs
           env:
             - name: POD_NAME
               valueFrom:
@@ -51,15 +119,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-          # Startup probe — gives up to 5 min for PaddleOCR / TF model load
+
+          # Startup probe — allows 5 min for models to load after init container finishes
           startupProbe:
             httpGet:
               path: /livez
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5
-            failureThreshold: 60      # 5-minute window for cold start
-          # Liveness — restart the pod if it hangs
+            failureThreshold: 60
+
           livenessProbe:
             httpGet:
               path: /livez
@@ -68,7 +137,7 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 3
             failureThreshold: 3
-          # Readiness — remove from Service endpoints until models are loaded
+
           readinessProbe:
             httpGet:
               path: /readyz
@@ -77,6 +146,7 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
+
           resources:
             requests:
               cpu: "1"
@@ -85,8 +155,10 @@ spec:
               cpu: "2"
               memory: "3Gi"
 
-          # Writable scratch dirs (root filesystem is read-only in production)
           volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
             - name: tmp
               mountPath: /tmp
             - name: app-cache
@@ -97,10 +169,12 @@ spec:
           lifecycle:
             preStop:
               exec:
-                # Give the LB time to drain before shutdown
                 command: ["/bin/sh", "-c", "sleep 10"]
 
       volumes:
+        - name: models
+          emptyDir:
+            sizeLimit: 5Gi
         - name: tmp
           emptyDir:
             sizeLimit: 2Gi

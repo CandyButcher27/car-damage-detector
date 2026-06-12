@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: data-ingestion-config
-  namespace: tameen
+  namespace: staging
   labels:
     app: data-ingestion
 data:
@@ -11,8 +11,11 @@ data:
   UPSURE_SERVICE_VERSION: "1.1.0"
   UPSURE_ENV: "production"
 
+  # GCS base URL — init container downloads models from here at pod startup.
+  UPSURE_MODELS_BASE_URL: "https://cdn.tameen.om/digiLifeDoc"
+
   # --- HTTP / CORS ---
-  UPSURE_CORS_ORIGINS: "https://ocr.tameen.om"
+  UPSURE_CORS_ORIGINS: "https://ocr.tameen.om,http://localhost:3000"
   UPSURE_CORS_ALLOW_CREDENTIALS: "false"
   UPSURE_MAX_UPLOAD_BYTES: "26214400"
   UPSURE_REQUEST_TIMEOUT_SECONDS: "120"
@@ -29,9 +32,9 @@ data:
   # --- Models ---
   UPSURE_PRELOAD_MODELS: "true"
   UPSURE_REQUIRE_MODELS_FOR_READY: "true"
-  UPSURE_DAMAGE_MODEL: "/app/models/digiLifeDoc_damage_model.onnx"
-  UPSURE_YOLO_MODEL: "/app/models/digiLifeDoc_damage_detector_v2.onnx"
-  UPSURE_CAR_MODEL: "/app/models/digiLifeDoc_best_car_model_v2.onnx"
+  UPSURE_DAMAGE_MODEL: "/app/models/damage_model.onnx"
+  UPSURE_YOLO_MODEL: "/app/models/damage_detector_v2.onnx"
+  UPSURE_CAR_MODEL: "/app/models/best_car_model_v2.onnx"
   UPSURE_CAR_THRESHOLD: "0.65"
   UPSURE_CAR_MODEL_POSITIVE_HIGH: "false"
 
