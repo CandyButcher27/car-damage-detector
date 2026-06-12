@@ -1857,6 +1857,14 @@ async def process_document(
 
 
 # ── Damage pipeline helpers ────────────────────────────────────────────────
+def _car_gate_for_views(view_img_bytes: dict[str, bytes]) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    for name, img_bytes in view_img_bytes.items():
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        results[name] = _classify_car_image_from_image(img)
+    return results
+
+
 def _damage_for_view(img_bytes: bytes, yolo_available: bool) -> dict[str, Any]:
     """Single-view damage classification + YOLO localisation.
 
@@ -1988,6 +1996,29 @@ async def predict_damage(
                 details={"view": view_name},
             ) from exc
 
+    # Car gate: run classifier on all views, keep only car images.
+    car_gate = await run_in_threadpool(_car_gate_for_views, view_img_bytes)
+    skipped_views = {
+        name: {"reason": "not_a_car", "car_confidence": res["confidence"]}
+        for name, res in car_gate.items()
+        if not res["is_car"]
+    }
+    view_img_bytes = {name: b for name, b in view_img_bytes.items() if car_gate[name]["is_car"]}
+
+    if not view_img_bytes:
+        record_pipeline_latency("predict_damage", time.perf_counter() - pipeline_start)
+        payload = {
+            "damage_detected": False,
+            "total_views_analyzed": 0,
+            "overall_confidence": 0.0,
+            "per_view": {},
+            "plate": {"detected": False, "plate_text": "", "confidence": 0.0, "source_view": None},
+            "any_view_error": False,
+            "skipped_views": skipped_views,
+            "message": "No car images detected. Please submit images of a vehicle.",
+        }
+        return json_success(payload, request=request, start_perf=request.state.start_perf)
+
     # Phase 2: batched damage inference (single ORT call for N views)
     # in parallel with ANPR on the priority view.
     anpr_source_view = next((v for v in ANPR_VIEW_PRIORITY if v in view_img_bytes), None)
@@ -2053,6 +2084,7 @@ async def predict_damage(
         "per_view":             per_view,
         "plate":                plate,
         "any_view_error":       any_per_view_error,
+        "skipped_views":        skipped_views,
     }
     return json_success(payload, request=request, start_perf=request.state.start_perf)
 
