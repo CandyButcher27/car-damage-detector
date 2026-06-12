@@ -561,10 +561,183 @@ manifests, with `tini` reaping the OCR subprocess.
 Manifests live in [`k8s/`](k8s/):
 
 ```bash
-kubectl apply -f k8s/
+kubectl apply -n tameen -f k8s/
 ```
 
-`Deployment` uses startup / liveness / readiness probes pointed at
-`/livez` and `/readyz`, defines CPU/memory requests + limits, mounts
-models from a `PersistentVolumeClaim`, and is paired with a `HPA`
-(autoscaling/v2) and `PodDisruptionBudget`. See [k8s/README.md](k8s/README.md).
+Single replica; pod-restart pulls model artefacts from
+`UPSURE_MODELS_BASE_URL` (set in the ConfigMap) into an `emptyDir` via
+the `model-sync` init container. Service is exposed through
+`k8s/ingress.yaml` at `https://ocr.tameen.om`. Startup, liveness, and
+readiness probes hit `/livez` and `/readyz`. See [k8s/README.md](k8s/README.md).
+
+## End-to-end smoke against a live deployment
+
+Once a pod is rolled out, the public service answers on
+`https://ocr.tameen.om`. The same probes that the cluster uses for
+readiness gating work for an outside curl, and they're the cheapest way
+to confirm a deployment is healthy.
+
+> Set `BASE=https://ocr.tameen.om` (production) or
+> `BASE=http://localhost:8000` (a port-forward) and the snippets below
+> work in either environment.
+
+### 1. Probes — should each be a clean 200 with the envelope shape
+
+```bash
+BASE="https://ocr.tameen.om"
+
+# Liveness — always 200 if the process is alive.
+curl -fsS "$BASE/livez" | jq .
+
+# Readiness — 200 only when every critical model is loaded. 503 here
+# means the init container hasn't finished pulling weights yet OR a
+# model failed to load. The error envelope shows which component is red.
+curl -sS "$BASE/readyz" | jq .
+
+# Component health — useful for spotting "ANPR missing" / OCR slow.
+curl -fsS "$BASE/health" | jq '.data.components[] | {name, ready, critical, detail}'
+
+# Prometheus scrape endpoint. Should respond with text/plain metrics.
+curl -fsS "$BASE/metrics" | head -25
+```
+
+### 2. Request-ID round-trip
+
+```bash
+curl -fsS -H 'X-Request-ID: e2e-smoke-1' "$BASE/livez" -i \
+  | tee /dev/stderr | grep -i '^x-request-id'
+# Header should echo `e2e-smoke-1` and the JSON body's
+# `meta.request_id` should match.
+```
+
+### 3. Damage detection — single view
+
+```bash
+# Replace ./front.jpg with any real car photo.
+curl -fsS -X POST "$BASE/predict/damage" \
+  -H 'X-Request-ID: e2e-damage-1' \
+  -F "front=@./front.jpg" | jq .
+```
+
+Successful response shape:
+
+```json
+{
+  "success": true,
+  "data": {
+    "damage_detected": false,
+    "total_views_analyzed": 1,
+    "overall_confidence": 0.0,
+    "per_view": { "front": { "damage_detected": false, "confidence_score": 0.9999, "damages": [] } },
+    "plate": { "detected": false, "plate_text": "", "confidence": 0.0, "source_view": "front" },
+    "any_view_error": false
+  },
+  "error": null,
+  "meta": { "request_id": "...", "endpoint": "/predict/damage", "api_version": "v1", "latency_ms": 234 }
+}
+```
+
+### 4. Damage detection — full 4-view batch
+
+```bash
+curl -fsS -X POST "$BASE/predict/damage" \
+  -H 'X-Request-ID: e2e-damage-4v' \
+  -F "front=@./front.jpg" \
+  -F "back=@./back.jpg" \
+  -F "left=@./left.jpg" \
+  -F "right=@./right.jpg" \
+  | jq '.data | {damage_detected, overall_confidence,
+                  per_view: (.per_view | map_values({damage_detected, confidence_score,
+                                                    damages: (.damages | length)})),
+                  plate: .plate}'
+```
+
+### 5. Car classifier
+
+```bash
+curl -fsS -X POST "$BASE/predict/" \
+  -H 'X-Request-ID: e2e-car-1' \
+  -F "file=@./car.jpg" \
+  | jq '.data | {filename, is_car, confidence, threshold_used, backend}'
+
+# Negative case — push a not-car. `is_car` should be false with
+# CAR_THRESHOLD raised to 0.65 the model is calibrated against the
+# samples we benchmarked on.
+curl -fsS -X POST "$BASE/predict/" \
+  -F "file=@./not-a-car.jpg" \
+  | jq '.data | {is_car, confidence}'
+```
+
+### 6. Unified document processing
+
+```bash
+# OCR a Mulkiya image (skip card classification with `skip_ocr=true` if
+# you just want the front/back card detector result).
+curl -fsS -X POST "$BASE/api/v1/process" \
+  -F "file=@./Mulkiya_front.jpg" \
+  -F "process_type=mulkiya" \
+  -F "ocr_lang=ar" \
+  | jq '.data | {confidence_score, extracted_keys: (.extracted_data | keys), rag_chunks: (.rag_chunks | length)}'
+
+# PDF OCR
+curl -fsS -X POST "$BASE/api/v1/process" \
+  -F "file=@./sample.pdf" \
+  -F "process_type=pdf" \
+  -F "prefer_pdf_text=true" \
+  | jq '.data | {confidence_score, ocr_lines: (.raw_ocr.pages[0].lines | length), rag_chunks: (.rag_chunks | length)}'
+
+# Generic file inspection — no model invoked, useful as a baseline.
+curl -fsS -X POST "$BASE/api/v1/process" \
+  -F "file=@./README.md" \
+  -F "process_type=file" \
+  | jq '.data.classification'
+```
+
+### 7. Error envelope — guaranteed-failure cases
+
+```bash
+# Validation error (bad process_type).
+curl -sS -X POST "$BASE/api/v1/process" \
+  -F "file=@./car.jpg" \
+  -F "process_type=nope" \
+  | jq '.error'
+# expected: { "code": "VALIDATION_ERROR", "message": "...", "retryable": false, "details": {...} }
+
+# Payload too large (synthesised 30 MB body).
+dd if=/dev/zero of=/tmp/big.jpg bs=1M count=30 2>/dev/null
+curl -sS -X POST "$BASE/predict/" \
+  -F "file=@/tmp/big.jpg" \
+  | jq '.error'
+# expected: { "code": "PAYLOAD_TOO_LARGE", "message": "Upload exceeds the 25 MB limit.", ... }
+
+# Damage call against a non-image — surfaces `UNSUPPORTED_MEDIA`.
+curl -sS -X POST "$BASE/predict/damage" \
+  -F "front=@./README.md" \
+  | jq '.error'
+```
+
+### 8. Probe and confirm a freshly-rolled pod is fully ready
+
+```bash
+# Wait until /readyz is green (max 5 min, init container + model warmup).
+until curl -fsS "$BASE/readyz" > /dev/null; do
+  echo "$(date -Is)  not ready yet"
+  sleep 5
+done
+echo "$(date -Is)  ready"
+```
+
+### 9. Quick latency spot-check
+
+```bash
+for i in 1 2 3 4 5; do
+  curl -o /dev/null -s -w 'damage  %{http_code}  %{time_total}s  req=%{header_x-request-id}\n' \
+    -H "X-Request-ID: latency-$i" \
+    -X POST "$BASE/predict/damage" \
+    -F "front=@./front.jpg"
+done
+```
+
+Typical numbers from the staging cluster: probes ~5-20 ms, single-view
+damage ~80-200 ms, four-view damage ~600-900 ms (the YOLO step on each
+flagged view dominates), PDF OCR ~5-15 s on a pre-warmed image.
