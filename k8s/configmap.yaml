@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: data-ingestion-config
-  namespace: staging
+  namespace: tameen
   labels:
     app: data-ingestion
 data:

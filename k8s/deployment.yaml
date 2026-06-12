@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: data-ingestion
-  namespace: staging
+  namespace: tameen
   labels:
     app: data-ingestion
 spec:
