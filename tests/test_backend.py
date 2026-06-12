@@ -90,6 +90,38 @@ def _reset_circuits():
         cb.reset()
 
 
+# ── View-aware parts remap (post-bug 1.1.1) ─────────────────────────────────
+def test_remap_parts_for_front_view_swaps_tail_to_headlight():
+    """Front-view photos must never report tail-light parts. The legacy
+    `_PARTS_RULES` table assumes a back-of-car canonical viewpoint, so
+    every output for view='front' has to swap tail-light terminology to
+    the corresponding front-of-car equivalents."""
+    parts = ["left_tail_light", "left_reverse_light", "left_brake_light"]
+    remapped = poc_api._remap_parts_for_view("front", parts)
+    assert "left_tail_light" not in remapped
+    assert "left_headlight_assembly" in remapped
+    assert "left_brake_light" not in remapped
+    assert "left_indicator" in remapped
+
+
+def test_remap_parts_for_back_view_unchanged():
+    parts = ["left_tail_light", "left_brake_light"]
+    assert poc_api._remap_parts_for_view("back", parts) == parts
+
+
+def test_remap_parts_for_side_view_adjusts_glass_label():
+    parts = ["rear_windshield", "left_brake_light"]
+    out = poc_api._remap_parts_for_view("left", parts)
+    assert "left_rear_window" in out
+    assert "rear_windshield" not in out
+
+
+def test_remap_parts_with_unknown_view_is_passthrough():
+    parts = ["left_tail_light"]
+    assert poc_api._remap_parts_for_view(None, parts) == parts
+    assert poc_api._remap_parts_for_view("speedometer", parts) == parts
+
+
 # ── Envelope basics ──────────────────────────────────────────────────────────
 def test_root_returns_envelope():
     resp = client.get("/")

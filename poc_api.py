@@ -180,7 +180,27 @@ def _resolve_car_model_path() -> Path:
 
 
 CAR_MODEL_PATH = _resolve_car_model_path()
-DAMAGE_THRESHOLD = 0.25
+
+
+def _env_float_top(name: str, default: float) -> float:
+    """Sibling of _env_float defined later — needed early so threshold
+    constants can resolve before the function definitions below.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# Binary damage head sigmoid threshold. Bumped from 0.25 -> 0.5 in 1.1.1
+# after observing systematic false positives on clean cars in production
+# (per-view damage_detected=true with prob_damaged > 0.99 on visibly
+# undamaged photos). Tunable per-deployment via env so we can re-tune
+# without a redeploy while collecting calibration data.
+DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.50)
 DAMAGE_IMG_SIZE = 260
 DAMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DAMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -240,8 +260,12 @@ def _resolve_damage_model_path() -> Path:
 DAMAGE_MODEL_PATH = _resolve_damage_model_path()
 
 YOLO_SIZE = 640
-YOLO_CONF = 0.25
-YOLO_IOU = 0.45
+# YOLO detection confidence floor. Raised from 0.25 -> 0.50 in 1.1.1 to
+# stop low-confidence boxes (0.25-0.35 range) from surfacing in the
+# admin report as legitimate damage. Tunable via env.
+YOLO_CONF = _env_float_top("UPSURE_YOLO_CONF", 0.50)
+# NMS IoU — kept compile-time; rarely tuned per deployment.
+YOLO_IOU = _env_float_top("UPSURE_YOLO_IOU", 0.45)
 YOLO_CLASSES = ["car-part-crack", "deformation", "flat-tire", "glass-crack", "lamp-crack", "scratches"]
 SEVERITY_MINOR_MAX = 0.05
 SEVERITY_MODERATE_MAX = 0.15
@@ -578,7 +602,71 @@ def _get_region(bbox: list[float]) -> str:
     return "bottom_left" if rel_x <= 0 else "bottom_right"
 
 
-def _run_yolo_pipeline(img_bytes: bytes) -> list[dict[str, Any]]:
+# View-aware re-mapping for `parts_at_risk`. The legacy `_PARTS_RULES`
+# table was written assuming a canonical viewpoint (so top_left → tail
+# light, bottom_left → front bumper). That's only true when the photo is
+# of the BACK of the car; from the FRONT, top_left is actually the
+# windshield / headlight region. The substitutions below are applied
+# AFTER the legacy lookup, view by view.
+#
+# Each entry maps an *exact part name* in the rule output to its
+# view-correct equivalent. Anything not listed passes through unchanged.
+_PARTS_REMAP_BY_VIEW: dict[str, dict[str, str]] = {
+    # FRONT view: rear-of-car labels become front-of-car labels.
+    "front": {
+        "left_tail_light":              "left_headlight_assembly",
+        "right_tail_light":             "right_headlight_assembly",
+        "left_reverse_light":           "left_daytime_running_light",
+        "right_reverse_light":          "right_daytime_running_light",
+        "left_brake_light":             "left_indicator",
+        "right_brake_light":            "right_indicator",
+        "rear_windshield":              "windshield",
+        "rear_bumper":                  "front_bumper",
+        "rear_wiper":                   "wiper_linkage",
+    },
+    # BACK view: the legacy table is already calibrated for this — no
+    # remap needed. Entry kept for symmetry / future overrides.
+    "back": {},
+    # LEFT and RIGHT side views: top_* in pixel space corresponds to the
+    # FRONT half of the side panel (where the headlight sits) and
+    # bottom_* corresponds to the REAR (tail light). The legacy table
+    # has it inverted, so swap.
+    "left": {
+        "left_tail_light":              "left_headlight_assembly",
+        "right_tail_light":             "left_tail_light",  # rare
+        "left_reverse_light":           "left_daytime_running_light",
+        "left_brake_light":             "left_indicator",
+        "rear_windshield":              "left_rear_window",
+        "wiper_linkage":                "left_a_pillar",
+    },
+    "right": {
+        "right_tail_light":             "right_headlight_assembly",
+        "left_tail_light":              "right_tail_light",  # rare
+        "right_reverse_light":          "right_daytime_running_light",
+        "right_brake_light":            "right_indicator",
+        "rear_windshield":              "right_rear_window",
+        "wiper_linkage":                "right_a_pillar",
+    },
+}
+
+
+def _remap_parts_for_view(view: str | None, parts: list[str]) -> list[str]:
+    """View-aware adjustment of `parts_at_risk`.
+
+    The legacy `_PARTS_RULES` table is canonicalised to a back-of-car
+    viewpoint. Applying the substitutions below makes the part names
+    geometrically plausible for the actual view the photo was taken
+    from. If `view` is unknown / None we leave parts unchanged.
+    """
+    if not view or not parts:
+        return parts
+    remap = _PARTS_REMAP_BY_VIEW.get(view.lower())
+    if not remap:
+        return parts
+    return [remap.get(p, p) for p in parts]
+
+
+def _run_yolo_pipeline(img_bytes: bytes, view: str | None = None) -> list[dict[str, Any]]:
     arr = _preprocess_yolo(img_bytes)
     sess = _get_yolo_session()
     inp = sess.get_inputs()[0].name
@@ -604,7 +692,7 @@ def _run_yolo_pipeline(img_bytes: bytes) -> list[dict[str, Any]]:
         cls_name = YOLO_CLASSES[int(class_ids[i])]
         severity = _get_severity(bbox[2], bbox[3])
         region = _get_region(bbox)
-        parts = _PARTS_RULES.get((cls_name, region), [])
+        parts = _remap_parts_for_view(view, _PARTS_RULES.get((cls_name, region), []))
         repair = _REPAIR_RULES.get(
             (cls_name, severity),
             {"action": "Manual inspection required", "replace": False},
@@ -617,6 +705,7 @@ def _run_yolo_pipeline(img_bytes: bytes) -> list[dict[str, Any]]:
             "parts_at_risk": parts,
             "repair_action": repair["action"],
             "replace":       repair["replace"],
+            "view":          view,
         })
     return results
 
@@ -1857,7 +1946,11 @@ async def process_document(
 
 
 # ── Damage pipeline helpers ────────────────────────────────────────────────
-def _damage_for_view(img_bytes: bytes, yolo_available: bool) -> dict[str, Any]:
+def _damage_for_view(
+    img_bytes: bytes,
+    yolo_available: bool,
+    view: str | None = None,
+) -> dict[str, Any]:
     """Single-view damage classification + YOLO localisation.
 
     Kept for the 1-view fast path and as a fallback if batched inference
@@ -1865,22 +1958,23 @@ def _damage_for_view(img_bytes: bytes, yolo_available: bool) -> dict[str, Any]:
     ``_run_damage_inference_batch`` directly.
     """
     pred = DAMAGE_CB.call(lambda: _run_damage_inference(_preprocess_for_damage(img_bytes)))
-    return _finish_damage_view(pred, img_bytes, yolo_available)
+    return _finish_damage_view(pred, img_bytes, yolo_available, view=view)
 
 
 def _finish_damage_view(
     pred: dict[str, Any],
     img_bytes: bytes,
     yolo_available: bool,
+    view: str | None = None,
 ) -> dict[str, Any]:
     """Run YOLO and the general-damage fallback once a binary prediction is in."""
     if pred["damage_detected"] and yolo_available:
         try:
-            pred["damages"] = YOLO_CB.call(_run_yolo_pipeline, img_bytes)
+            pred["damages"] = YOLO_CB.call(_run_yolo_pipeline, img_bytes, view)
         except Exception as exc:
             log.warning(
                 "yolo failed for view; falling back",
-                extra={"event": "yolo.failed", "exception": repr(exc)},
+                extra={"event": "yolo.failed", "exception": repr(exc), "view": view},
             )
             pred["damages"] = []
     else:
@@ -1898,6 +1992,7 @@ def _finish_damage_view(
             "parts_at_risk": ["undetermined"],
             "replace": False,
             "repair_action": "Visual inspection required — damage detected but type could not be localized automatically",
+            "view": view,
         }]
     return pred
 
@@ -1909,7 +2004,9 @@ def _damage_batch_for_views(
     """Batched damage path: one binary inference for N views, then per-view YOLO.
 
     Runs entirely on the threadpool side — call from ``run_in_threadpool``
-    so the GIL doesn't bottleneck the event loop.
+    so the GIL doesn't bottleneck the event loop. The per-view YOLO call
+    is threaded the view name so its parts_at_risk gets the
+    geometrically-correct labels (see _PARTS_REMAP_BY_VIEW).
     """
     names = list(view_img_bytes.keys())
     if not names:
@@ -1922,7 +2019,7 @@ def _damage_batch_for_views(
 
     out: dict[str, dict[str, Any]] = {}
     for name, pred in zip(names, batch_preds):
-        out[name] = _finish_damage_view(pred, view_img_bytes[name], yolo_available)
+        out[name] = _finish_damage_view(pred, view_img_bytes[name], yolo_available, view=name)
     return out
 
 

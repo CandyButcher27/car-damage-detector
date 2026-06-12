@@ -37,6 +37,10 @@ data:
   UPSURE_CAR_MODEL: "/app/models/best_car_model_v2.onnx"
   UPSURE_CAR_THRESHOLD: "0.65"
   UPSURE_CAR_MODEL_POSITIVE_HIGH: "false"
+  # Bumped in 1.1.1 after FP burst on clean cars. Re-tune from observed
+  # precision/recall once we have a labelled production set.
+  UPSURE_DAMAGE_THRESHOLD: "0.50"
+  UPSURE_YOLO_CONF: "0.50"
 
   # --- OCR ---
   UPSURE_OCR_PYTHON: "/usr/local/bin/python"
