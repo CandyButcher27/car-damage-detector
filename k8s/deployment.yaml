@@ -71,7 +71,8 @@ spec:
               download_if_missing "damage_model.onnx"
               download_if_missing "damage_detector_v2.onnx"
               download_if_missing "best_car_model_v2.onnx"
-              download_if_missing "card_noncard_classifier_model.keras"
+              download_if_missing "card_noncard_classifier_model.onnx"
+              download_if_missing "mulkiya_classifier_model.onnx"
 
               echo "All models ready:"
               ls -lh /app/models/

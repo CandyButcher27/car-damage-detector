@@ -80,7 +80,7 @@ from app.resilience import Bulkhead, CircuitBreaker, retry, run_with_timeout, sa
 from app.responses import envelope_success, json_error, json_success
 from app.settings import SETTINGS, repo_root
 
-from card_inference import CardNonCardModel, _resolve_model_path
+from card_inference import CardNonCardModel
 from onnx_inference import BinaryOnnxImageClassifier
 from rag_json_chunker import chunk_json_file
 
@@ -145,15 +145,6 @@ if load_keras_model is not None:
 POC_DIR = repo_root()
 OCR_SCRIPT = POC_DIR / "ocr_simple_test.py"
 
-try:
-    MODEL_PATH = _resolve_model_path(POC_DIR, None)
-except FileNotFoundError as _mp_exc:
-    MODEL_PATH = POC_DIR / "models" / "card_noncard_classifier_model.keras"
-    log.warning(
-        "card classifier model not found",
-        extra={"event": "model.missing", "path": str(MODEL_PATH), "exception": repr(_mp_exc)},
-    )
-
 # Car classifier resolution: prefer ONNX (faster, no Keras dep), fall back
 # to the legacy .keras model. UPSURE_CAR_MODEL env var overrides everything.
 _CAR_MODEL_CANDIDATES = [
@@ -181,6 +172,41 @@ def _resolve_car_model_path() -> Path:
 
 CAR_MODEL_PATH = _resolve_car_model_path()
 
+# Card / non-card classifier: prefer ONNX (no Keras dep), fall back to the
+# legacy .keras model handled by card_inference.CardNonCardModel.
+# UPSURE_CARD_MODEL overrides everything.
+_CARD_MODEL_CANDIDATES = [
+    "models/card_noncard_classifier_model.onnx",
+    "models/digiLifeDoc_card_noncard_classifier_model.onnx",
+    "models/card_noncard_model.keras",
+    "models/card_noncard_classifier_model.keras",
+]
+
+# Mulkiya classifier: ONNX only. Runs *after* the card gate — an input is
+# only classified for Mulkiya once card_noncard says it is a card.
+_MULKIYA_MODEL_CANDIDATES = [
+    "models/mulkiya_classifier_model.onnx",
+    "models/digiLifeDoc_mulkiya_classifier_model.onnx",
+]
+
+
+def _resolve_named_model_path(env_var: str, candidates: list[str]) -> Path:
+    override = os.getenv(env_var)
+    if override:
+        path = Path(override)
+        if not path.is_absolute():
+            path = POC_DIR / path
+        return path
+    for candidate in candidates:
+        path = POC_DIR / candidate
+        if path.exists():
+            return path
+    return POC_DIR / candidates[-1]
+
+
+CARD_MODEL_PATH = _resolve_named_model_path("UPSURE_CARD_MODEL", _CARD_MODEL_CANDIDATES)
+MULKIYA_MODEL_PATH = _resolve_named_model_path("UPSURE_MULKIYA_MODEL", _MULKIYA_MODEL_CANDIDATES)
+
 
 def _env_float_top(name: str, default: float) -> float:
     """Sibling of _env_float defined later — needed early so threshold
@@ -201,6 +227,11 @@ def _env_float_top(name: str, default: float) -> float:
 # undamaged photos). Tunable per-deployment via env so we can re-tune
 # without a redeploy while collecting calibration data.
 DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.50)
+
+# Default decision thresholds for the Mulkiya two-stage pipeline. Overridable
+# per-request via the /api/v1/process form fields, or globally via env.
+CARD_THRESHOLD = _env_float_top("UPSURE_CARD_THRESHOLD", 0.50)
+MULKIYA_THRESHOLD = _env_float_top("UPSURE_MULKIYA_THRESHOLD", 0.50)
 DAMAGE_IMG_SIZE = 260
 DAMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DAMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -383,7 +414,8 @@ _ocr_bulkhead = Bulkhead("ocr", SETTINGS.ocr_concurrency)
 
 
 # ── Lazy model singletons ──────────────────────────────────────────────────
-_card_model: CardNonCardModel | None = None
+_card_classifier: BinaryOnnxImageClassifier | CardNonCardModel | None = None
+_mulkiya_classifier: BinaryOnnxImageClassifier | None = None
 _car_model: Any | None = None
 _car_img_size = CAR_FALLBACK_SIZE
 _damage_session: ort.InferenceSession | None = None
@@ -391,8 +423,34 @@ _yolo_session: ort.InferenceSession | None = None
 
 
 @retry(attempts=3, base_delay=0.5, max_delay=4.0)
-def _load_card_model() -> CardNonCardModel:
-    return CardNonCardModel.load(MODEL_PATH)
+def _load_card_classifier() -> BinaryOnnxImageClassifier | CardNonCardModel:
+    """Card / non-card classifier. ONNX-first, Keras fallback.
+
+    ONNX exports are wrapped by BinaryOnnxImageClassifier; the legacy .keras
+    artefact falls back to the pure-numpy CardNonCardModel.
+    """
+    if not CARD_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Card model file not found at {CARD_MODEL_PATH}")
+    if CARD_MODEL_PATH.suffix.lower() == ".onnx":
+        return BinaryOnnxImageClassifier(
+            CARD_MODEL_PATH,
+            positive_label="card",
+            negative_label="non_card",
+            positive_when_output_high=_env_bool("UPSURE_CARD_MODEL_POSITIVE_HIGH", True),
+        )
+    return CardNonCardModel.load(CARD_MODEL_PATH)
+
+
+@retry(attempts=3, base_delay=0.5, max_delay=4.0)
+def _load_mulkiya_classifier() -> BinaryOnnxImageClassifier:
+    if not MULKIYA_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Mulkiya model file not found at {MULKIYA_MODEL_PATH}")
+    return BinaryOnnxImageClassifier(
+        MULKIYA_MODEL_PATH,
+        positive_label="mulkiya",
+        negative_label="non_mulkiya",
+        positive_when_output_high=_env_bool("UPSURE_MULKIYA_MODEL_POSITIVE_HIGH", True),
+    )
 
 
 @retry(attempts=3, base_delay=0.5, max_delay=4.0)
@@ -458,12 +516,43 @@ def _load_yolo_session() -> ort.InferenceSession:
     return ort.InferenceSession(str(YOLO_MODEL_PATH), providers=["CPUExecutionProvider"])
 
 
-def _get_card_model() -> CardNonCardModel:
-    global _card_model
-    if _card_model is None:
-        _card_model = _load_card_model()
+def _get_card_classifier() -> BinaryOnnxImageClassifier | CardNonCardModel:
+    global _card_classifier
+    if _card_classifier is None:
+        _card_classifier = _load_card_classifier()
         set_model_readiness("card_noncard", True)
-    return _card_model
+    return _card_classifier
+
+
+def _get_mulkiya_classifier() -> BinaryOnnxImageClassifier:
+    global _mulkiya_classifier
+    if _mulkiya_classifier is None:
+        _mulkiya_classifier = _load_mulkiya_classifier()
+        set_model_readiness("mulkiya", True)
+    return _mulkiya_classifier
+
+
+def _classify_card_image(image: Image.Image, threshold: float) -> dict[str, Any]:
+    """Stage 1 of the Mulkiya pipeline. Returns a normalized
+    {"label": "card"|"not card", "probability": float} dict for both the
+    ONNX and Keras backends.
+    """
+    model = _get_card_classifier()
+    if isinstance(model, BinaryOnnxImageClassifier):
+        result = model.classify(image, threshold)
+        probability = result["card_probability"]
+        label = "card" if result["label"] == "card" else "not card"
+    else:
+        probability = model.predict_probability(image, normalize=True)
+        label = "card" if probability >= threshold else "not card"
+    return {"label": label, "probability": probability}
+
+
+def _classify_mulkiya_image(image: Image.Image, threshold: float) -> dict[str, Any]:
+    """Stage 2 of the Mulkiya pipeline. Only runs once stage 1 confirms a card."""
+    result = _get_mulkiya_classifier().classify(image, threshold)
+    label = "mulkiya" if result["label"] == "mulkiya" else "not mulkiya"
+    return {"label": label, "probability": result["mulkiya_probability"]}
 
 
 def _get_car_img_size(loaded_model: Any) -> int:
@@ -1404,6 +1493,7 @@ async def lifespan(app: FastAPI):
     set_model_readiness("yolo_damage", False)
     set_model_readiness("car_classifier", False)
     set_model_readiness("card_noncard", False)
+    set_model_readiness("mulkiya", False)
     set_model_readiness("anpr", False)
 
     log.info(
@@ -1422,7 +1512,8 @@ async def lifespan(app: FastAPI):
         for label, loader in (
             ("damage_binary", _get_damage_session),
             ("yolo_damage", _get_yolo_session),
-            ("card_noncard", _get_card_model),
+            ("card_noncard", _get_card_classifier),
+            ("mulkiya", _get_mulkiya_classifier),
             ("car_classifier", _get_car_model),
         ):
             try:
@@ -1542,22 +1633,41 @@ def _check_anpr_model() -> ComponentStatus:
 
 
 def _check_card_model() -> ComponentStatus:
-    global _card_model
-    if _card_model is not None:
-        return ComponentStatus("card_noncard", True, critical=False, extra={"path": str(MODEL_PATH)})
-    if not MODEL_PATH.exists():
+    global _card_classifier
+    if _card_classifier is not None:
+        return ComponentStatus("card_noncard", True, critical=False, extra={"path": str(CARD_MODEL_PATH)})
+    if not CARD_MODEL_PATH.exists():
         return ComponentStatus(
             "card_noncard", False, critical=False,
             detail="card/noncard model file not found",
-            extra={"path": str(MODEL_PATH)},
+            extra={"path": str(CARD_MODEL_PATH)},
         )
     try:
-        _card_model = _load_card_model.__wrapped__()
+        _card_classifier = _load_card_classifier.__wrapped__()
         set_model_readiness("card_noncard", True)
-        return ComponentStatus("card_noncard", True, critical=False, extra={"path": str(MODEL_PATH)})
+        return ComponentStatus("card_noncard", True, critical=False, extra={"path": str(CARD_MODEL_PATH)})
     except Exception as exc:
         set_model_readiness("card_noncard", False)
-        return ComponentStatus("card_noncard", False, critical=False, detail=str(exc), extra={"path": str(MODEL_PATH)})
+        return ComponentStatus("card_noncard", False, critical=False, detail=str(exc), extra={"path": str(CARD_MODEL_PATH)})
+
+
+def _check_mulkiya_model() -> ComponentStatus:
+    global _mulkiya_classifier
+    if _mulkiya_classifier is not None:
+        return ComponentStatus("mulkiya", True, critical=False, extra={"path": str(MULKIYA_MODEL_PATH)})
+    if not MULKIYA_MODEL_PATH.exists():
+        return ComponentStatus(
+            "mulkiya", False, critical=False,
+            detail="mulkiya model file not found",
+            extra={"path": str(MULKIYA_MODEL_PATH)},
+        )
+    try:
+        _mulkiya_classifier = _load_mulkiya_classifier.__wrapped__()
+        set_model_readiness("mulkiya", True)
+        return ComponentStatus("mulkiya", True, critical=False, extra={"path": str(MULKIYA_MODEL_PATH)})
+    except Exception as exc:
+        set_model_readiness("mulkiya", False)
+        return ComponentStatus("mulkiya", False, critical=False, detail=str(exc), extra={"path": str(MULKIYA_MODEL_PATH)})
 
 
 def _check_circuits() -> ComponentStatus:
@@ -1578,6 +1688,7 @@ health_registry.register("damage_binary", _check_damage_model)
 health_registry.register("yolo_damage", _check_yolo_model)
 health_registry.register("car_classifier", _check_car_model)
 health_registry.register("card_noncard", _check_card_model)
+health_registry.register("mulkiya", _check_mulkiya_model)
 health_registry.register("anpr", _check_anpr_model)
 health_registry.register("circuits", _check_circuits)
 
@@ -1718,7 +1829,8 @@ async def process_document(
     request: Request,
     file: UploadFile = File(...),
     process_type: Literal["car", "mulkiya", "pdf", "file"] = Form(...),
-    card_threshold: float = Form(0.5),
+    card_threshold: float = Form(CARD_THRESHOLD),
+    mulkiya_threshold: float = Form(MULKIYA_THRESHOLD),
     ocr_lang: str = Form("ar"),
     prefer_pdf_text: bool = Form(False),
     skip_ocr: bool = Form(False),
@@ -1816,14 +1928,57 @@ async def process_document(
                     raise UnsupportedMediaError(
                         f"Could not convert uploaded file to a Mulkiya model image: {exc}",
                     ) from exc
-                probability = _get_card_model().predict_probability(image, normalize=True)
-                label = "card" if probability >= card_threshold else "not card"
+
+                # Stage 1: card / non-card gate. Only a card proceeds to the
+                # Mulkiya classifier and OCR.
+                try:
+                    card_result = _classify_card_image(image, card_threshold)
+                except (FileNotFoundError, RuntimeError) as exc:
+                    raise ModelUnavailableError(str(exc)) from exc
+
+                if card_result["label"] != "card":
+                    classification = {
+                        "label": "not card",
+                        "stage": "card_noncard",
+                        "card_classification": {
+                            "label": card_result["label"],
+                            "probability": card_result["probability"],
+                            "threshold": card_threshold,
+                        },
+                    }
+                    payload = _build_pipeline_response(
+                        source_name=source_name,
+                        input_kind="image",
+                        classification=classification,
+                        confidence_score=card_result["probability"],
+                        extracted_data=None,
+                        raw_ocr=None,
+                        chunk_source_path=None,
+                        note="Input classified as not a card; Mulkiya classification and OCR skipped.",
+                        car_classification=None,
+                        normalized_input=model_input,
+                    )
+                    record_pipeline_latency("process_mulkiya_not_card", time.perf_counter() - pipeline_start)
+                    return json_success(payload, request=request, start_perf=request.state.start_perf)
+
+                # Stage 2: Mulkiya classifier (card confirmed).
+                try:
+                    mulkiya_result = _classify_mulkiya_image(image, mulkiya_threshold)
+                except (FileNotFoundError, RuntimeError) as exc:
+                    raise ModelUnavailableError(str(exc)) from exc
+
                 classification = {
-                    "label": label,
-                    "probability": probability,
-                    "threshold": card_threshold,
+                    "label": mulkiya_result["label"],
+                    "probability": mulkiya_result["probability"],
+                    "threshold": mulkiya_threshold,
+                    "stage": "mulkiya",
+                    "card_classification": {
+                        "label": card_result["label"],
+                        "probability": card_result["probability"],
+                        "threshold": card_threshold,
+                    },
                 }
-                confidence_score = probability
+                confidence_score = mulkiya_result["probability"]
             else:
                 model_input = None
                 classification = {

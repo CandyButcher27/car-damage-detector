@@ -26,7 +26,8 @@ Health check: `GET http://localhost:8000/health`
 | `damage_model.onnx` | binary car damage detector (EfficientNet-B2) | 31MB self-contained — MUST be single-file export, NOT split |
 | `damage_detector_v2.onnx` | YOLO damage localizer (6 classes) | production model, mAP50=0.672 |
 | `best_car_model_v2.onnx` (or `digiLifeDoc_best_car_model_v2.onnx`) | car binary classifier | ONNX preferred (see `onnx_inference.BinaryOnnxImageClassifier`); `.keras` is auto-detected as fallback |
-| `card_noncard_classifier_model.keras` | card/non-card classifier | used by card_inference.py |
+| `card_noncard_classifier_model.onnx` (or `digiLifeDoc_card_noncard_classifier_model.onnx`) | card/non-card classifier | ONNX-first via `onnx_inference.BinaryOnnxImageClassifier`; `.keras` (`card_inference.CardNonCardModel`) is auto-detected fallback |
+| `mulkiya_classifier_model.onnx` (or `digiLifeDoc_mulkiya_classifier_model.onnx`) | Mulkiya / non-Mulkiya classifier | ONNX single-sigmoid; runs only after the card gate passes |
 | `anpr_plate_detector/` | YOLOv4 TF SavedModel for license plate detection | SavedModel dir: saved_model.pb + variables/ |
 
 **CRITICAL:** `damage_model.onnx` must be a self-contained single-file ONNX export (~31MB).
@@ -44,6 +45,22 @@ A split export (~736KB + `.data` companion) will fail with:
 
 All responses use the envelope `{ success, data, error, meta }`. Tests in
 `tests/test_backend.py` use the `ok()` / `err()` helpers to dig in.
+
+### Mulkiya two-stage pipeline (`process_type=mulkiya`, image input)
+```
+Stage 1 — card / non-card gate (card_noncard ONNX, card_threshold)
+   ├─ label != "card"  → short-circuit: classification.label="not card",
+   │                      Mulkiya classifier + OCR skipped (note explains why)
+   └─ label == "card"  → Stage 2
+Stage 2 — Mulkiya classifier (mulkiya ONNX, mulkiya_threshold)
+           → classification.{label,probability,stage,card_classification}
+           → then OCR extraction (unchanged), unless skip_ocr
+```
+Form fields: `card_threshold` (default `UPSURE_CARD_THRESHOLD`), `mulkiya_threshold`
+(default `UPSURE_MULKIYA_THRESHOLD`). PDF Mulkiya inputs skip the image classifiers
+(OCR-only path, unchanged). Both classifiers are `BinaryOnnxImageClassifier`;
+card falls back to the `.keras` `CardNonCardModel` when no ONNX is present.
+`/readyz` now tracks a `mulkiya` component alongside `card_noncard`.
 
 ## Damage + ANPR Pipeline (`/predict/damage`)
 Damage and ANPR run **in parallel** using `asyncio.gather` + `run_in_threadpool`.
@@ -110,6 +127,12 @@ If OCR path missing, OCR endpoints fail but damage/card endpoints work fine.
 |-----|---------|---------|
 | `UPSURE_DAMAGE_MODEL` | override binary model path | `models/damage_model.onnx` |
 | `UPSURE_YOLO_MODEL` | override YOLO model path | `models/damage_detector_v2.onnx` |
+| `UPSURE_CARD_MODEL` | override card/non-card model path | auto-detect ONNX→keras |
+| `UPSURE_MULKIYA_MODEL` | override Mulkiya model path | auto-detect ONNX |
+| `UPSURE_CARD_THRESHOLD` | card-gate sigmoid cutoff | `0.50` |
+| `UPSURE_MULKIYA_THRESHOLD` | Mulkiya sigmoid cutoff | `0.50` |
+| `UPSURE_CARD_MODEL_POSITIVE_HIGH` | high output = card | `true` |
+| `UPSURE_MULKIYA_MODEL_POSITIVE_HIGH` | high output = mulkiya | `true` |
 | `UPSURE_OCR_PYTHON` | path to OCR venv python | `D:/UpSure/OCR_test/venv/Scripts/python.exe` |
 
 ## Virtual Environment
