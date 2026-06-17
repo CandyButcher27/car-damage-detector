@@ -24,7 +24,7 @@ services:
       UPSURE_REQUIRE_MODELS_FOR_READY: "false"
       # Override paths if your local model artefacts use the digiLifeDoc_* names.
       # UPSURE_DAMAGE_MODEL: /app/models/digiLifeDoc_damage_model.onnx
-      # UPSURE_YOLO_MODEL:   /app/models/digiLifeDoc_damage_detector_v2.onnx
+      # UPSURE_YOLO_MODEL:   /app/models/digiLifeDoc_damage_detector_v3.onnx
     volumes:
       - ./models:/app/models:ro
       - ./Samples:/app/Samples:ro
