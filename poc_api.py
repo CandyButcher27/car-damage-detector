@@ -266,7 +266,11 @@ YOLO_SIZE = 640
 YOLO_CONF = _env_float_top("UPSURE_YOLO_CONF", 0.50)
 # NMS IoU — kept compile-time; rarely tuned per deployment.
 YOLO_IOU = _env_float_top("UPSURE_YOLO_IOU", 0.45)
-YOLO_CLASSES = ["car-part-crack", "deformation", "flat-tire", "glass-crack", "lamp-crack", "scratches"]
+# damage_detector_v3 (YOLO11m, CarDD) emits classes in a different order/name
+# scheme than v2. We map each v3 class index onto the canonical rule-table key
+# below so `_PARTS_RULES` / `_REPAIR_RULES` and the API `type` field stay stable.
+#   v3 index: 0 dent  1 scratch  2 crack  3 shattered_glass  4 broken_lamp  5 flat_tire
+YOLO_CLASSES = ["deformation", "scratches", "car-part-crack", "glass-crack", "lamp-crack", "flat-tire"]
 SEVERITY_MINOR_MAX = 0.05
 SEVERITY_MODERATE_MAX = 0.15
 _CAR_BBOX = [0.5, 0.5, 1.0, 1.0]
@@ -277,7 +281,10 @@ def _resolve_yolo_model_path() -> Path:
     if env_path:
         return Path(env_path)
     candidates = [
+        POC_DIR / "models" / "damage_detector_v3.onnx",
+        POC_DIR / "models" / "digiLifeDoc_damage_detector_v3.onnx",
         POC_DIR / "models" / "damage_detector_v2.onnx",
+        POC_DIR / "models" / "digiLifeDoc_damage_detector_v2.onnx",
         POC_DIR / "models" / "damage_detector.onnx",
     ]
     for c in candidates:
