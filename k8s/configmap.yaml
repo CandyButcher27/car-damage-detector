@@ -15,7 +15,7 @@ data:
   UPSURE_MODELS_BASE_URL: "https://cdn.tameen.om/digiLifeDoc"
 
   # --- HTTP / CORS ---
-  UPSURE_CORS_ORIGINS: "https://ocr.tameen.om,http://localhost:3000"
+  UPSURE_CORS_ORIGINS: "*"
   UPSURE_CORS_ALLOW_CREDENTIALS: "false"
   UPSURE_MAX_UPLOAD_BYTES: "26214400"
   UPSURE_REQUEST_TIMEOUT_SECONDS: "120"
