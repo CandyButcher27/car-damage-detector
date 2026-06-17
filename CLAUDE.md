@@ -24,7 +24,7 @@ Health check: `GET http://localhost:8000/health`
 | File/Dir | Purpose | Notes |
 |----------|---------|-------|
 | `damage_model.onnx` | binary car damage detector (EfficientNet-B2) | 31MB self-contained — MUST be single-file export, NOT split |
-| `damage_detector_v2.onnx` | YOLO damage localizer (6 classes) | production model, mAP50=0.672 |
+| `damage_detector_v3.onnx` (or `digiLifeDoc_damage_detector_v3.onnx`) | YOLO damage localizer (YOLO11m, CarDD, 6 classes) | production model; v3 class order/names differ from v2 — remapped to canonical keys in `YOLO_CLASSES`. v2 kept as fallback. |
 | `best_car_model_v2.onnx` (or `digiLifeDoc_best_car_model_v2.onnx`) | car binary classifier | ONNX preferred (see `onnx_inference.BinaryOnnxImageClassifier`); `.keras` is auto-detected as fallback |
 | `card_noncard_classifier_model.keras` | card/non-card classifier | used by card_inference.py |
 | `anpr_plate_detector/` | YOLOv4 TF SavedModel for license plate detection | SavedModel dir: saved_model.pb + variables/ |
@@ -53,7 +53,7 @@ Phase 1 (async sequential): read all upload bytes, decode to JPEG
 Phase 2 (parallel via thread pool):
   ├─ per view (front/back/left/right):
   │    binary model (damage_model.onnx)
-  │      → if prob_damaged > 0.25: YOLO (damage_detector_v2.onnx)
+  │      → if prob_damaged > 0.25: YOLO (damage_detector_v3.onnx)
   │      → severity from bbox area: <5% minor, 5-15% moderate, >15% severe
   │      → parts + repair from rule tables
   │      → fallback: YOLO empty but binary positive → "general-damage" entry
@@ -86,7 +86,8 @@ Key constants in `poc_api.py`:
 DAMAGE_THRESHOLD  = 0.25   # binary model cutoff
 YOLO_CONF         = 0.25   # YOLO detection threshold
 YOLO_IOU          = 0.45
-YOLO_CLASSES      = ["car-part-crack", "deformation", "flat-tire", "glass-crack", "lamp-crack", "scratches"]
+# v3 model index order, remapped to canonical rule-table keys (v3: dent, scratch, crack, shattered_glass, broken_lamp, flat_tire)
+YOLO_CLASSES      = ["deformation", "scratches", "car-part-crack", "glass-crack", "lamp-crack", "flat-tire"]
 SEVERITY_MINOR_MAX    = 0.05   # bbox area fraction
 SEVERITY_MODERATE_MAX = 0.15
 ANPR_VIEW_PRIORITY    = ["front", "back", "left", "right"]
@@ -109,7 +110,7 @@ If OCR path missing, OCR endpoints fail but damage/card endpoints work fine.
 | Var | Purpose | Default |
 |-----|---------|---------|
 | `UPSURE_DAMAGE_MODEL` | override binary model path | `models/damage_model.onnx` |
-| `UPSURE_YOLO_MODEL` | override YOLO model path | `models/damage_detector_v2.onnx` |
+| `UPSURE_YOLO_MODEL` | override YOLO model path | `models/damage_detector_v3.onnx` |
 | `UPSURE_OCR_PYTHON` | path to OCR venv python | `D:/UpSure/OCR_test/venv/Scripts/python.exe` |
 
 ## Virtual Environment

@@ -74,7 +74,7 @@ The main service is `poc_api.py`. It accepts uploads, normalizes each file into 
 | `/api/v1/process`, `process_type=mulkiya`, PDF input | Card classifier is skipped -> if `skip_ocr=false`: PDF text layer or `PaddleOCR` -> rule-based extraction -> RAG chunking |
 | `/api/v1/process`, `process_type=pdf` | PDF text layer when `prefer_pdf_text=true` and text exists, otherwise `PaddleOCR` -> RAG chunking |
 | `/api/v1/process`, `process_type=file` | No ML model. File inspection only, then JSON chunking. |
-| `/predict/damage` | Single batched ONNX call across submitted views via `damage_model.onnx`; for each damaged view also runs `damage_detector_v2.onnx`. In parallel, one selected view runs ANPR: YOLOv4 plate detector -> PaddleOCR plate OCR. |
+| `/predict/damage` | Single batched ONNX call across submitted views via `damage_model.onnx`; for each damaged view also runs `damage_detector_v3.onnx`. In parallel, one selected view runs ANPR: YOLOv4 plate detector -> PaddleOCR plate OCR. |
 
 Models in `poc_api.py` are lazy-loaded. The first request that needs a model loads it into memory; later requests reuse the cached model/session.
 
@@ -87,7 +87,7 @@ Place model files in `models/` before starting the services.
 | `best_car_model_v2.onnx` / `digiLifeDoc_best_car_model_v2.onnx` | Car classification in `/predict/` and `/api/v1/process` with `process_type=car`. ONNX path is preferred; `.keras` is auto-detected as fallback. |
 | `card_noncard_classifier_model.keras` | Mulkiya card vs not-card classification for image uploads. The loader also accepts the legacy filename `card_noncard_model.keras`. |
 | `damage_model.onnx` / `digiLifeDoc_damage_model.onnx` | Stage 1 binary damage classification for `/predict/damage`. |
-| `damage_detector_v2.onnx` / `digiLifeDoc_damage_detector_v2.onnx` | Stage 2 YOLO damage-type/localization model. Fallback filename: `damage_detector.onnx`. |
+| `damage_detector_v3.onnx` / `digiLifeDoc_damage_detector_v3.onnx` | Stage 2 YOLO damage-type/localization model (YOLO11m, CarDD). Fallback filenames: `damage_detector_v2.onnx`, `digiLifeDoc_damage_detector_v2.onnx`, `damage_detector.onnx`. |
 | `models/anpr_plate_detector/` | TensorFlow SavedModel used by `plate_pipeline.py` for license-plate detection. |
 | `mulkiya_classifier_model.keras` | Legacy artifact. It is present in some setups but is not the default model used by the current loader. |
 
@@ -98,7 +98,7 @@ models/
 |-- digiLifeDoc_best_car_model_v2.onnx       (or best_car_model_v2.onnx)
 |-- card_noncard_classifier_model.keras
 |-- digiLifeDoc_damage_model.onnx            (or damage_model.onnx)
-|-- digiLifeDoc_damage_detector_v2.onnx      (or damage_detector_v2.onnx)
+|-- digiLifeDoc_damage_detector_v3.onnx      (or damage_detector_v3.onnx)
 `-- anpr_plate_detector/
 ```
 
@@ -106,7 +106,7 @@ Useful model environment overrides:
 
 ```bat
 set UPSURE_DAMAGE_MODEL=D:\path\to\damage_model.onnx
-set UPSURE_YOLO_MODEL=D:\path\to\damage_detector_v2.onnx
+set UPSURE_YOLO_MODEL=D:\path\to\damage_detector_v3.onnx
 ```
 
 If an ONNX model was exported with external data, keep its companion `.data` file next to the `.onnx` file.
@@ -294,7 +294,7 @@ Behavior:
 1. Each submitted view is normalized to JPEG. PDFs are rendered to their first page.
 2. `damage_model.onnx` runs on every submitted view.
 3. If any view is damaged, the top-level `damage_detected` is `true`.
-4. For each damaged view, `damage_detector_v2.onnx` runs when available.
+4. For each damaged view, `damage_detector_v3.onnx` runs when available.
 5. YOLO outputs are enriched with severity, parts-at-risk, repair action, and replacement recommendation.
 6. If the YOLO model is missing or fails, the route still returns a binary damage result and falls back to a generic damage entry when needed.
 7. In parallel with damage inference, ANPR runs on the best available view by priority: `front`, `back`, `left`, then `right`.
@@ -443,7 +443,7 @@ Check:
 
 Check:
 
-1. `models/damage_detector_v2.onnx` exists, or `UPSURE_YOLO_MODEL` points to a valid ONNX file.
+1. `models/damage_detector_v3.onnx` exists, or `UPSURE_YOLO_MODEL` points to a valid ONNX file.
 2. ONNX Runtime can load the file.
 
 The damage route can still return Stage 1 binary damage results if the YOLO damage model is missing.

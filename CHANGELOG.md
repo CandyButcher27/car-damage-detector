@@ -4,6 +4,21 @@ All notable changes to this project are tracked here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Stage 2 YOLO damage localizer upgraded from `damage_detector_v2.onnx`
+  (YOLOv8, 6 classes) to `damage_detector_v3.onnx` (YOLO11m, CarDD, 6 classes).
+  v3 emits classes in a different index order and naming scheme
+  (`dent`, `scratch`, `crack`, `shattered_glass`, `broken_lamp`, `flat_tire`);
+  `YOLO_CLASSES` now remaps each v3 index onto the existing canonical rule-table
+  keys, so `_PARTS_RULES` / `_REPAIR_RULES` and the API `type` field are
+  unchanged. v2 filenames remain as auto-detect fallbacks.
+- `UPSURE_YOLO_MODEL` default and k8s model fetch now target v3.
+- `UPSURE_YOLO_CONF` lowered 0.50 -> 0.25: v3's confidence distribution sits
+  well below v2, and at 0.50 damaged views surfaced no localized boxes. Re-tune
+  from a labelled set via the threshold sweep.
+
 ## [1.1.0] - 2026-06-11
 
 This is the production-hardening release. Every endpoint now returns a
