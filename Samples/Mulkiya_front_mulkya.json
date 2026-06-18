@@ -1,13 +1,15 @@
 {
+  "document_type": "mulkiya",
+  "is_mulkiya": true,
   "plate_number": "52514",
-  "plate_text": "بب",
+  "plate_text": null,
   "vehicle_type": "خصوصي",
-  "make": "تويوتا",
+  "make": null,
   "model": "كورولا",
-  "color": "ابيض",
+  "color": "أبيض",
   "year": 2018,
   "model_year": 2019,
-  "country_of_origin": "الولايات المتحدة الامريكية",
+  "country_of_origin": null,
   "vin_or_chassis": "5YFBURHE7KP872881",
   "engine_number": "NIL",
   "engine_cc": 1800,
@@ -17,11 +19,28 @@
   "issue_date": "2024/06/02",
   "expiry_date": "2025/05/06",
   "owner_name": null,
-  "notes": "Heuristic extraction with auxiliary English OCR fallback.",
+  "notes": "Heuristic extraction.",
+  "quality": {
+    "usable": true,
+    "valid_field_count": 8,
+    "document_type": "mulkiya",
+    "reason": "ok",
+    "message": null,
+    "field_checks": {
+      "vin": true,
+      "plate": true,
+      "engine_cc": true,
+      "weight": true,
+      "year": true,
+      "issue_date": true,
+      "expiry_date": true,
+      "vehicle_type": true
+    }
+  },
   "source": {
     "input": "Samples\\Mulkiya_front.jpg",
-    "lang": "ar",
-    "auxiliary_ocr_lang": "en",
+    "lang": "en",
+    "auxiliary_ocr_lang": "ar",
     "fix_arabic_reverse": false,
     "reshape_arabic": false
   }

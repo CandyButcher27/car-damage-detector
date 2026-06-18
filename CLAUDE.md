@@ -14,7 +14,6 @@ Health check: `GET http://localhost:8000/health`
 
 ## Key Files
 - `poc_api.py` — single-file FastAPI app, all endpoints
-- `plate_pipeline.py` — ANPR (license plate detection + OCR); imported by poc_api.py
 - `card_inference.py` — card/non-card classifier (used by poc_api.py)
 - `rag_json_chunker.py` — JSON chunking for RAG (used by poc_api.py)
 - `models/` — all model files (see below)
@@ -26,8 +25,8 @@ Health check: `GET http://localhost:8000/health`
 | `damage_model.onnx` | binary car damage detector (EfficientNet-B2) | 31MB self-contained — MUST be single-file export, NOT split |
 | `damage_detector_v3.onnx` (or `digiLifeDoc_damage_detector_v3.onnx`) | YOLO damage localizer (YOLO11m, CarDD, 6 classes) | production model; v3 class order/names differ from v2 — remapped to canonical keys in `YOLO_CLASSES`. v2 kept as fallback. |
 | `best_car_model_v2.onnx` (or `digiLifeDoc_best_car_model_v2.onnx`) | car binary classifier | ONNX preferred (see `onnx_inference.BinaryOnnxImageClassifier`); `.keras` is auto-detected as fallback |
-| `card_noncard_classifier_model.keras` | card/non-card classifier | used by card_inference.py |
-| `anpr_plate_detector/` | YOLOv4 TF SavedModel for license plate detection | SavedModel dir: saved_model.pb + variables/ |
+| `digiLifeDoc_card_noncard_classifier_model.onnx` | card/non-card classifier | ONNX via `BinaryOnnxImageClassifier`; used in mulkiya path |
+| `digiLifeDoc_mulkiya_classifier_model.onnx` | mulkiya front/back side classifier | ONNX via `BinaryOnnxImageClassifier`; `UPSURE_MULKIYA_FRONT_HIGH` flips polarity |
 
 **CRITICAL:** `damage_model.onnx` must be a self-contained single-file ONNX export (~31MB).
 A split export (~736KB + `.data` companion) will fail with:
@@ -45,41 +44,33 @@ A split export (~736KB + `.data` companion) will fail with:
 All responses use the envelope `{ success, data, error, meta }`. Tests in
 `tests/test_backend.py` use the `ok()` / `err()` helpers to dig in.
 
-## Damage + ANPR Pipeline (`/predict/damage`)
-Damage and ANPR run **in parallel** using `asyncio.gather` + `run_in_threadpool`.
+## Damage Pipeline (`/predict/damage`)
+Batched damage inference over submitted views via `run_in_threadpool`.
 
 ```
-Phase 1 (async sequential): read all upload bytes, decode to JPEG
-Phase 2 (parallel via thread pool):
-  ├─ per view (front/back/left/right):
-  │    binary model (damage_model.onnx)
-  │      → if prob_damaged > 0.25: YOLO (damage_detector_v3.onnx)
-  │      → severity from bbox area: <5% minor, 5-15% moderate, >15% severe
-  │      → parts + repair from rule tables
-  │      → fallback: YOLO empty but binary positive → "general-damage" entry
-  └─ ANPR (plate_pipeline.py, view priority: front > back > left > right):
-       YOLOv4 TF SavedModel → detect plate bbox → PaddleOCR → plate text
+Phase 1 (async sequential): read all upload bytes, decode to JPEG, car-gate each view
+Phase 2 (batched ONNX call over surviving car views):
+  per view (front/back/left/right):
+    binary model (damage_model.onnx)
+      → if prob_damaged > 0.25: YOLO (damage_detector_v3.onnx)
+      → severity from bbox area: <5% minor, 5-15% moderate, >15% severe
+      → parts + repair from rule tables
+      → fallback: YOLO empty but binary positive → "general-damage" entry
 
 overall_confidence = max(confidence_score) across DAMAGED views only
 ```
 
-Response adds `plate` key:
+Response:
 ```json
 {
   "damage_detected": true,
   "overall_confidence": 0.82,
   "total_views_analyzed": 4,
   "per_view": { "front": {...}, "back": {...}, ... },
-  "plate": {
-    "detected": true,
-    "plate_text": "12 AB 345",
-    "confidence": 0.91,
-    "num_plates": 1,
-    "source_view": "front"
-  }
+  "any_view_error": false,
+  "skipped_views": {}
 }
 ```
-If `plate_pipeline` not importable (e.g. missing `paddleocr`): `plate.detected = false`, `plate.error` set.
 
 Key constants in `poc_api.py`:
 ```python
@@ -90,7 +81,6 @@ YOLO_IOU          = 0.45
 YOLO_CLASSES      = ["deformation", "scratches", "car-part-crack", "glass-crack", "lamp-crack", "flat-tire"]
 SEVERITY_MINOR_MAX    = 0.05   # bbox area fraction
 SEVERITY_MODERATE_MAX = 0.15
-ANPR_VIEW_PRIORITY    = ["front", "back", "left", "right"]
 ```
 
 ## Running Tests
@@ -115,7 +105,8 @@ If OCR path missing, OCR endpoints fail but damage/card endpoints work fine.
 
 ## Virtual Environment
 `.venv` lives in repo root. All deps in `requirements.txt`.
-Key packages: `fastapi`, `uvicorn`, `onnxruntime==1.20.1`, `keras==3.12.2`, `tensorflow==2.20.0`, `pillow`, `numpy`.
+Key packages: `fastapi`, `uvicorn`, `onnxruntime==1.20.1`, `rapidocr>=3.5.0`, `tensorflow-cpu==2.20.0` (legacy .keras fallback only), `pillow`, `numpy`.
+OCR: `rapidocr` v3 (PP-OCR det+rec on onnxruntime). Arabic rec model (`arabic_PP-OCRv4_rec_mobile.onnx`) auto-downloads on first use. No PaddlePaddle.
 
 ## Frontend Integration
 digi-motor frontend proxies `/damage-api` → `http://localhost:8000` (via `setupProxy.js`).

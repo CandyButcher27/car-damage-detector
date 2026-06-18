@@ -6,7 +6,21 @@ All notable changes to this project are tracked here. Format follows
 
 ## [Unreleased]
 
+### Removed
+- ANPR / license-plate-detection pipeline removed entirely: `plate_pipeline.py`,
+  the `models/anpr_plate_detector/` SavedModel slot, the `anpr_pipeline` circuit
+  breaker, the `anpr` health check, the `_anpr_for_view` helper, and the `plate`
+  key on `/predict/damage` responses. `/predict/damage` now returns damage-only.
+  (The Mulkiya document `plate_number` field, read from OCR text, is unrelated
+  and unchanged.)
+
 ### Changed
+- OCR migrated off PaddleOCR/PaddlePaddle to `rapidocr` v3 (PP-OCR det+rec on
+  onnxruntime). Mulkiya extraction now runs an Arabic + English dual-pass so
+  numeric fields and Arabic text fields are both captured. Arabic recognition
+  model auto-downloads on first use.
+- Mulkiya front/back ONNX classifier (`digiLifeDoc_mulkiya_classifier_model.onnx`)
+  wired into `process_type=mulkiya`; response gains `classification.mulkiya_side`.
 - Stage 2 YOLO damage localizer upgraded from `damage_detector_v2.onnx`
   (YOLOv8, 6 classes) to `damage_detector_v3.onnx` (YOLO11m, CarDD, 6 classes).
   v3 emits classes in a different index order and naming scheme

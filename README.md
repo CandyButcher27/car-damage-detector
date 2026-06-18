@@ -1,13 +1,13 @@
 # UpSure data-ingestion
 
-FastAPI service for vehicle, Mulkiya, OCR, file-inspection, damage-analysis, and ANPR workflows.
+FastAPI service for vehicle, Mulkiya, OCR, file-inspection, and damage-analysis workflows.
 
 The main service is `poc_api.py`. It accepts uploads, normalizes each file into the format required by the selected pipeline, runs the appropriate model or OCR process, and returns a structured JSON response.
 
 > **Production note** — every endpoint now returns a unified envelope
 > (`{success, data, error, meta}`), runs behind a request-id middleware,
 > exports Prometheus metrics on `/metrics`, exposes `/livez` and `/readyz`
-> k8s probes, and protects downstream OCR/ANPR/YOLO calls with circuit
+> k8s probes, and protects downstream OCR/YOLO calls with circuit
 > breakers. See [Production Deployment](#production-deployment) below.
 
 ## What The Project Does
@@ -19,20 +19,18 @@ The main service is `poc_api.py`. It accepts uploads, normalizes each file into 
 5. Inspects general files without OCR or model inference.
 6. Detects vehicle damage across one to four uploaded views.
 7. Runs damage localization/type detection only when binary damage is detected.
-8. Runs ANPR on the best available vehicle view and reads plate text.
-9. Produces RAG-friendly chunks from OCR JSON or structured JSON artifacts.
-10. Provides latency and benchmark utilities for the available routes.
+8. Produces RAG-friendly chunks from OCR JSON or structured JSON artifacts.
+9. Provides latency and benchmark utilities for the available routes.
 
 ## Main Entry Points
 
 | File | Purpose |
 |---|---|
-| `poc_api.py` | Main FastAPI app. Owns routing, normalization, OCR orchestration, model calls, damage flow, ANPR integration, and response assembly. |
+| `poc_api.py` | Main FastAPI app. Owns routing, normalization, OCR orchestration, model calls, damage flow, and response assembly. |
 | `onnx_inference.py` | Generic `BinaryOnnxImageClassifier` + `YoloOnnxDetector` used by the car / damage paths. |
 | `app/` | Cross-cutting concerns: settings, structured logging, observability, resilience patterns, error taxonomy, response envelope, k8s health probes. |
 | `card_inference.py` | Lightweight NumPy/HDF5 loader for the card vs not-card Keras model. |
 | `ocr_simple_test.py` | OCR worker script called by `poc_api.py` in a subprocess. Produces OCR JSON and optional Mulkiya JSON. |
-| `plate_pipeline.py` | ANPR pipeline: plate detection with YOLOv4 TensorFlow SavedModel and plate OCR with PaddleOCR. |
 | `rag_json_chunker.py` | Converts OCR or structured JSON into chunk objects suitable for RAG workflows. |
 | `latency_analyzer.py` | Latency-focused benchmark runner. |
 | `benchmark_everything.py` | Broader benchmark runner that can save JSON/CSV results. |
@@ -47,7 +45,6 @@ The main service is `poc_api.py`. It accepts uploads, normalizes each file into 
 |-- onnx_inference.py
 |-- card_inference.py
 |-- ocr_simple_test.py
-|-- plate_pipeline.py
 |-- rag_json_chunker.py
 |-- latency_analyzer.py
 |-- benchmark_everything.py
@@ -70,11 +67,11 @@ The main service is `poc_api.py`. It accepts uploads, normalizes each file into 
 |---|---|
 | `/predict/` | `best_car_model_v2.onnx` (auto-detects `.keras` fallback) via `BinaryOnnxImageClassifier` |
 | `/api/v1/process`, `process_type=car` | Same car classifier as `/predict/` |
-| `/api/v1/process`, `process_type=mulkiya`, image input | `card_noncard_classifier_model.keras` -> if `skip_ocr=false`: `PaddleOCR` -> rule-based Mulkiya extraction -> RAG chunking |
-| `/api/v1/process`, `process_type=mulkiya`, PDF input | Card classifier is skipped -> if `skip_ocr=false`: PDF text layer or `PaddleOCR` -> rule-based extraction -> RAG chunking |
-| `/api/v1/process`, `process_type=pdf` | PDF text layer when `prefer_pdf_text=true` and text exists, otherwise `PaddleOCR` -> RAG chunking |
+| `/api/v1/process`, `process_type=mulkiya`, image input | card/non-card ONNX classifier + mulkiya front/back ONNX classifier -> if `skip_ocr=false`: RapidOCR (Arabic + English dual-pass) -> rule-based Mulkiya extraction -> RAG chunking |
+| `/api/v1/process`, `process_type=mulkiya`, PDF input | Card classifier is skipped -> if `skip_ocr=false`: PDF text layer or RapidOCR -> rule-based extraction -> RAG chunking |
+| `/api/v1/process`, `process_type=pdf` | PDF text layer when `prefer_pdf_text=true` and text exists, otherwise RapidOCR -> RAG chunking |
 | `/api/v1/process`, `process_type=file` | No ML model. File inspection only, then JSON chunking. |
-| `/predict/damage` | Single batched ONNX call across submitted views via `damage_model.onnx`; for each damaged view also runs `damage_detector_v3.onnx`. In parallel, one selected view runs ANPR: YOLOv4 plate detector -> PaddleOCR plate OCR. |
+| `/predict/damage` | Single batched ONNX call across submitted views via `damage_model.onnx`; for each damaged view also runs `damage_detector_v3.onnx`. |
 
 Models in `poc_api.py` are lazy-loaded. The first request that needs a model loads it into memory; later requests reuse the cached model/session.
 
@@ -88,18 +85,17 @@ Place model files in `models/` before starting the services.
 | `card_noncard_classifier_model.keras` | Mulkiya card vs not-card classification for image uploads. The loader also accepts the legacy filename `card_noncard_model.keras`. |
 | `damage_model.onnx` / `digiLifeDoc_damage_model.onnx` | Stage 1 binary damage classification for `/predict/damage`. |
 | `damage_detector_v3.onnx` / `digiLifeDoc_damage_detector_v3.onnx` | Stage 2 YOLO damage-type/localization model (YOLO11m, CarDD). Fallback filenames: `damage_detector_v2.onnx`, `digiLifeDoc_damage_detector_v2.onnx`, `damage_detector.onnx`. |
-| `models/anpr_plate_detector/` | TensorFlow SavedModel used by `plate_pipeline.py` for license-plate detection. |
-| `mulkiya_classifier_model.keras` | Legacy artifact. It is present in some setups but is not the default model used by the current loader. |
+| `digiLifeDoc_mulkiya_classifier_model.onnx` / `mulkiya_classifier_model.onnx` | Mulkiya front vs back side classifier for image uploads (`process_type=mulkiya`). |
 
 Expected local contents:
 
 ```text
 models/
-|-- digiLifeDoc_best_car_model_v2.onnx       (or best_car_model_v2.onnx)
-|-- card_noncard_classifier_model.keras
-|-- digiLifeDoc_damage_model.onnx            (or damage_model.onnx)
-|-- digiLifeDoc_damage_detector_v3.onnx      (or damage_detector_v3.onnx)
-`-- anpr_plate_detector/
+|-- digiLifeDoc_best_car_model_v2.onnx              (or best_car_model_v2.onnx)
+|-- digiLifeDoc_card_noncard_classifier_model.onnx
+|-- digiLifeDoc_damage_model.onnx                   (or damage_model.onnx)
+|-- digiLifeDoc_damage_detector_v3.onnx             (or damage_detector_v3.onnx)
+`-- digiLifeDoc_mulkiya_classifier_model.onnx
 ```
 
 Useful model environment overrides:
@@ -117,9 +113,9 @@ Requirements:
 
 1. Python 3.10+.
 2. Packages from `requirements.txt`.
-3. TensorFlow or Keras for the car model and ANPR SavedModel.
-4. ONNX Runtime for damage models.
-5. PaddleOCR for OCR and plate reading.
+3. TensorFlow or Keras only as a fallback loader for any legacy `.keras` card/car artefact.
+4. ONNX Runtime for car, card, damage, YOLO, and mulkiya-side models.
+5. RapidOCR (onnxruntime backend) for OCR; Arabic + English PP-OCR recognition models.
 6. PyMuPDF for PDF conversion and optional PDF text extraction.
 
 ### OCR Python Override
@@ -170,8 +166,7 @@ Checks and reports:
 1. Resolved model paths.
 2. Binary damage-model readiness and errors.
 3. YOLO damage-model readiness and errors.
-4. ANPR model/readiness and errors.
-5. OCR script path.
+4. OCR script path.
 
 ### `POST /predict/`
 
@@ -208,7 +203,7 @@ Optional form fields:
 | Field | Default | Meaning |
 |---|---:|---|
 | `card_threshold` | `0.5` | Threshold for Mulkiya image card/not-card classification. |
-| `ocr_lang` | `ar` | PaddleOCR language. |
+| `ocr_lang` | `en` | RapidOCR primary recognition language. Mulkiya runs a dual-pass (primary + opposite-language aux), so `en` captures numerics directly and Arabic text via the aux pass. Batch-verified as the stronger primary. |
 | `prefer_pdf_text` | `false` | For PDFs, use embedded text when available before OCR. |
 | `skip_ocr` | `false` | For Mulkiya, stop after classification. |
 | `translate_to_en` | `false` | Add local dictionary-based English helper translation. |
@@ -278,7 +273,7 @@ curl.exe -X POST "http://localhost:8000/api/v1/process" ^
 
 ### `POST /predict/damage`
 
-Vehicle damage and plate endpoint.
+Vehicle damage endpoint.
 
 Accepted multipart fields:
 
@@ -297,7 +292,6 @@ Behavior:
 4. For each damaged view, `damage_detector_v3.onnx` runs when available.
 5. YOLO outputs are enriched with severity, parts-at-risk, repair action, and replacement recommendation.
 6. If the YOLO model is missing or fails, the route still returns a binary damage result and falls back to a generic damage entry when needed.
-7. In parallel with damage inference, ANPR runs on the best available view by priority: `front`, `back`, `left`, then `right`.
 
 Damage classes:
 
@@ -345,9 +339,9 @@ curl.exe -X POST "http://localhost:8000/predict/damage" ^
 4. `--extract_mulkya` for Mulkiya OCR
 5. `--prefer_pdf_text` for PDF OCR when requested
 
-For images, the script runs PaddleOCR directly and writes `<stem>_ocr.json`. For Mulkiya images, it also tries to write `<stem>_mulkya.json` using rule-based extraction. If Arabic OCR misses important fields, the script can run an auxiliary English OCR pass to improve extraction.
+For images, the script runs RapidOCR directly and writes `<stem>_ocr.json`. For Mulkiya images, it also tries to write `<stem>_mulkya.json` using rule-based extraction. The Mulkiya path runs a dual-pass: the primary-language model plus an auxiliary opposite-language pass (Arabic ↔ English) so numeric fields and Arabic text fields are both captured.
 
-For PDFs, `prefer_pdf_text=true` lets the script use the embedded PDF text layer when available. Otherwise, each page is rendered and passed through PaddleOCR.
+For PDFs, `prefer_pdf_text=true` lets the script use the embedded PDF text layer when available. Otherwise, each page is rendered and passed through RapidOCR.
 
 ## Translation Support
 
@@ -427,7 +421,7 @@ The upload could not be converted into the format needed by the selected pipelin
 Check:
 
 1. `UPSURE_OCR_PYTHON`
-2. PaddleOCR installation in the selected interpreter
+2. RapidOCR installation in the selected interpreter
 3. PyMuPDF installation for PDF inputs
 4. Whether the OCR subprocess error in the API response points to a missing package or model
 
@@ -447,14 +441,6 @@ Check:
 2. ONNX Runtime can load the file.
 
 The damage route can still return Stage 1 binary damage results if the YOLO damage model is missing.
-
-### ANPR not available
-
-Check:
-
-1. `plate_pipeline.py` imports successfully.
-2. `models/anpr_plate_detector/` exists.
-3. TensorFlow and PaddleOCR are installed in the API environment.
 
 ### Car model load failure
 
@@ -532,7 +518,7 @@ Error codes: `VALIDATION_ERROR`, `UNSUPPORTED_MEDIA`, `PAYLOAD_TOO_LARGE`,
 ### Resilience patterns
 
 * **Circuit breakers** wrap each downstream — `damage_binary`,
-  `yolo_damage`, `anpr_pipeline`, `ocr_subprocess`. After
+  `yolo_damage`, `ocr_subprocess`. After
   `UPSURE_CB_FAILURE_THRESHOLD` consecutive failures the breaker opens for
   `UPSURE_CB_RECOVERY_SECONDS`; one probe call is allowed in half-open.
 * **Retry with backoff** on model load at startup (capped exponential + jitter).
@@ -594,7 +580,7 @@ curl -fsS "$BASE/livez" | jq .
 # model failed to load. The error envelope shows which component is red.
 curl -sS "$BASE/readyz" | jq .
 
-# Component health — useful for spotting "ANPR missing" / OCR slow.
+# Component health — useful for spotting model load failures / OCR slow.
 curl -fsS "$BASE/health" | jq '.data.components[] | {name, ready, critical, detail}'
 
 # Prometheus scrape endpoint. Should respond with text/plain metrics.
@@ -629,7 +615,6 @@ Successful response shape:
     "total_views_analyzed": 1,
     "overall_confidence": 0.0,
     "per_view": { "front": { "damage_detected": false, "confidence_score": 0.9999, "damages": [] } },
-    "plate": { "detected": false, "plate_text": "", "confidence": 0.0, "source_view": "front" },
     "any_view_error": false
   },
   "error": null,
@@ -648,8 +633,7 @@ curl -fsS -X POST "$BASE/predict/damage" \
   -F "right=@./right.jpg" \
   | jq '.data | {damage_detected, overall_confidence,
                   per_view: (.per_view | map_values({damage_detected, confidence_score,
-                                                    damages: (.damages | length)})),
-                  plate: .plate}'
+                                                    damages: (.damages | length)}))}'
 ```
 
 ### 5. Car classifier
