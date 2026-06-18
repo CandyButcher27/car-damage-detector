@@ -241,7 +241,6 @@ def damage_pipeline(client: httpx.Client, report: Report) -> None:
                                        "confidence": v.get("confidence_score"),
                                        "damages": len(v.get("damages", []))}
                                    for k, v in per_view.items()},
-                    "plate": data.get("plate"),
                 })
 
     # 2) all four views
@@ -264,10 +263,6 @@ def damage_pipeline(client: httpx.Client, report: Report) -> None:
                                     "conf": round(v.get("confidence_score", 0), 3),
                                     "types": [d.get("type") for d in v.get("damages", [])]}
                                 for k, v in per_view.items()},
-                    "plate": {"detected": data.get("plate", {}).get("detected"),
-                              "source": data.get("plate", {}).get("source_view"),
-                              "text": data.get("plate", {}).get("plate_text"),
-                              "error": data.get("plate", {}).get("error")},
                 })
 
     # 3) non-image: validation/conversion failure shape

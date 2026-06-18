@@ -177,7 +177,7 @@ def run(base_url: str) -> int:
             print(f"        error: {(body.get('error') or {})}")
         else:
             data = body.get("data") or {}
-            for k in ("damage_detected", "total_views_analyzed", "overall_confidence", "per_view", "plate"):
+            for k in ("damage_detected", "total_views_analyzed", "overall_confidence", "per_view"):
                 if not check(f"data has '{k}'", k in data):
                     failures += 1
             if "per_view" in data:
@@ -189,11 +189,6 @@ def run(base_url: str) -> int:
                         print(f"        - {view}: damage_detected={payload.get('damage_detected')}  "
                               f"conf={payload.get('confidence_score'):.3f}  "
                               f"damages={len(payload.get('damages', []))}")
-            if "plate" in data:
-                p = data["plate"]
-                print(f"        plate: detected={p.get('detected')}  text={p.get('plate_text')!r}  "
-                      f"conf={p.get('confidence')}  source={p.get('source_view')}  "
-                      f"error={p.get('error', None)}")
 
     # ── 7. /api/v1/process — process_type=file ──────────────────────────
     banner("POST /api/v1/process  (process_type=file)")

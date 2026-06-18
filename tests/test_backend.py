@@ -83,10 +83,10 @@ def _mock_damage_batch(batch):
 @pytest.fixture(autouse=True)
 def _reset_circuits():
     """Each test gets a clean slate so a previously-tripped breaker doesn't bleed."""
-    for cb in (poc_api.OCR_CB, poc_api.ANPR_CB, poc_api.YOLO_CB, poc_api.DAMAGE_CB):
+    for cb in (poc_api.OCR_CB, poc_api.YOLO_CB, poc_api.DAMAGE_CB):
         cb.reset()
     yield
-    for cb in (poc_api.OCR_CB, poc_api.ANPR_CB, poc_api.YOLO_CB, poc_api.DAMAGE_CB):
+    for cb in (poc_api.OCR_CB, poc_api.YOLO_CB, poc_api.DAMAGE_CB):
         cb.reset()
 
 
@@ -200,41 +200,20 @@ def test_damage_response_has_required_keys():
     with (
         patch("poc_api._get_damage_session"),
         patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         resp = client.post("/predict/damage", files={"front": _car_file()})
 
     assert resp.status_code == 200
     data = ok(resp)
-    for key in ("damage_detected", "total_views_analyzed", "overall_confidence", "per_view", "plate"):
+    for key in ("damage_detected", "total_views_analyzed", "overall_confidence", "per_view"):
         assert key in data, f"missing top-level key: {key}"
-
-
-def test_damage_plate_key_has_required_fields():
-    mock_anpr = {
-        "detected": True, "plate_text": "12 AB 345",
-        "confidence": 0.88, "num_plates": 1,
-        "annotated_image": "", "plate_crop": "",
-    }
-    with (
-        patch("poc_api._get_damage_session"),
-        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
-        patch("poc_api._ANPR_AVAILABLE", True),
-        patch("poc_api._run_anpr_pipeline", return_value=mock_anpr),
-    ):
-        resp = client.post("/predict/damage", files={"front": _car_file()})
-
-    assert resp.status_code == 200
-    plate = ok(resp)["plate"]
-    for key in ("detected", "plate_text", "confidence", "source_view"):
-        assert key in plate
+    assert "plate" not in data
 
 
 def test_damage_per_view_contains_submitted_views():
     with (
         patch("poc_api._get_damage_session"),
         patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         resp = client.post(
             "/predict/damage",
@@ -248,90 +227,6 @@ def test_damage_per_view_contains_submitted_views():
     data = ok(resp)
     assert data["total_views_analyzed"] == 3
     assert set(data["per_view"].keys()) == {"front", "back", "left"}
-
-
-# ── ANPR integration logic ────────────────────────────────────────────────────
-def test_anpr_uses_front_view_first():
-    called_on: list[bytes] = []
-
-    def mock_anpr(img_bytes, is_oman_plate=False):
-        called_on.append(img_bytes)
-        return {
-            "detected": False, "plate_text": "", "confidence": 0.0,
-            "num_plates": 0, "annotated_image": "", "plate_crop": None,
-        }
-
-    with (
-        patch("poc_api._get_damage_session"),
-        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
-        patch("poc_api._ANPR_AVAILABLE", True),
-        patch("poc_api._run_anpr_pipeline", side_effect=mock_anpr),
-    ):
-        resp = client.post(
-            "/predict/damage",
-            files={
-                "back":  _car_file("back.jpg"),
-                "front": _car_file("front.jpg"),
-            },
-        )
-
-    assert resp.status_code == 200
-    data = ok(resp)
-    assert data["plate"]["source_view"] == "front"
-    assert len(called_on) == 1
-
-
-def test_anpr_falls_back_to_back_when_no_front():
-    with (
-        patch("poc_api._get_damage_session"),
-        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
-        patch("poc_api._ANPR_AVAILABLE", True),
-        patch("poc_api._run_anpr_pipeline", return_value={
-            "detected": False, "plate_text": "", "confidence": 0.0,
-            "num_plates": 0, "annotated_image": "", "plate_crop": None,
-        }),
-    ):
-        resp = client.post(
-            "/predict/damage",
-            files={"back": _car_file("back.jpg"), "left": _car_file("left.jpg")},
-        )
-
-    assert resp.status_code == 200
-    assert ok(resp)["plate"]["source_view"] == "back"
-
-
-def test_anpr_unavailable_returns_plate_with_error():
-    with (
-        patch("poc_api._get_damage_session"),
-        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
-        patch("poc_api._ANPR_AVAILABLE", False),
-    ):
-        resp = client.post("/predict/damage", files={"front": _car_file()})
-
-    assert resp.status_code == 200
-    plate = ok(resp)["plate"]
-    assert plate["detected"] is False
-    assert "error" in plate
-
-
-def test_anpr_result_included_in_plate():
-    with (
-        patch("poc_api._get_damage_session"),
-        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
-        patch("poc_api._ANPR_AVAILABLE", True),
-        patch("poc_api._run_anpr_pipeline", return_value={
-            "detected": True, "plate_text": "AB 1234", "confidence": 0.92,
-            "num_plates": 1, "annotated_image": "", "plate_crop": "",
-        }),
-    ):
-        resp = client.post("/predict/damage", files={"front": _car_file()})
-
-    assert resp.status_code == 200
-    plate = ok(resp)["plate"]
-    assert plate["detected"] is True
-    assert plate["plate_text"] == "AB 1234"
-    assert plate["confidence"] == pytest.approx(0.92)
-    assert plate["source_view"] == "front"
 
 
 # ── Damage business logic ─────────────────────────────────────────────────────
@@ -350,7 +245,6 @@ def test_overall_confidence_only_from_damaged_views():
         patch("poc_api._get_damage_session"),
         patch("poc_api._run_damage_inference_batch", side_effect=batch_side_effect),
         patch("poc_api._run_yolo_pipeline", return_value=[]),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         resp = client.post(
             "/predict/damage",
@@ -372,7 +266,6 @@ def test_fallback_general_damage_when_yolo_empty():
         patch("poc_api._run_damage_inference_batch",
               return_value=[_mock_damage_pred(damaged=True, conf=0.85)]),
         patch("poc_api._run_yolo_pipeline", return_value=[]),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         resp = client.post("/predict/damage", files={"front": _car_file()})
 
@@ -390,7 +283,6 @@ def test_fallback_severity_severe_at_high_prob():
             "prob_damaged": 0.90, "prob_clean": 0.10,
         }]),
         patch("poc_api._run_yolo_pipeline", return_value=[]),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         resp = client.post("/predict/damage", files={"front": _car_file()})
 
@@ -405,7 +297,6 @@ def test_fallback_severity_moderate_at_mid_prob():
             "prob_damaged": 0.70, "prob_clean": 0.30,
         }]),
         patch("poc_api._run_yolo_pipeline", return_value=[]),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         resp = client.post("/predict/damage", files={"front": _car_file()})
 
@@ -417,7 +308,6 @@ def test_no_damage_returns_empty_damages_list():
         patch("poc_api._get_damage_session"),
         patch("poc_api._run_damage_inference_batch",
               return_value=[_mock_damage_pred(damaged=False)]),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         resp = client.post("/predict/damage", files={"front": _car_file()})
 
@@ -443,7 +333,6 @@ def test_yolo_failures_open_circuit_after_threshold():
         patch("poc_api._run_damage_inference_batch",
               return_value=[_mock_damage_pred(damaged=True, conf=0.85)]),
         patch("poc_api._run_yolo_pipeline", side_effect=RuntimeError("yolo blew up")),
-        patch("poc_api._ANPR_AVAILABLE", False),
     ):
         for _ in range(threshold):
             client.post("/predict/damage", files={"front": _car_file()})
@@ -512,7 +401,6 @@ def test_integration_real_damage_inference():
     assert isinstance(data["damage_detected"], bool)
     assert 0.0 <= data["overall_confidence"] <= 1.0
     assert "damages" in data["per_view"]["front"]
-    assert "plate" in data
 
 
 @pytest.mark.skipif(
@@ -534,15 +422,3 @@ def test_integration_all_four_views():
     data = ok(resp)
     assert data["total_views_analyzed"] == 4
     assert set(data["per_view"].keys()) == {"front", "back", "left", "right"}
-
-
-@pytest.mark.skipif(
-    not (MODELS / "anpr_plate_detector" / "saved_model.pb").exists() or not poc_api._ANPR_AVAILABLE,
-    reason="ANPR SavedModel not present or plate_pipeline not importable",
-)
-def test_integration_anpr_model_loadable():
-    from plate_pipeline import get_model, get_reader
-    model = get_model()
-    assert model is not None
-    reader = get_reader()
-    assert reader is not None

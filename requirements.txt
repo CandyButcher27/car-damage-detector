@@ -1,8 +1,8 @@
 # UpSure data-ingestion — production runtime dependencies.
 #
 # Only direct imports are pinned; pip resolves transitives. This is the
-# smallest set that runs the full feature surface (damage, YOLO, OCR,
-# ANPR) on a CPU-only pod.
+# smallest set that runs the full feature surface (damage, YOLO, OCR)
+# on a CPU-only pod.
 #
 # Notable choices vs. an earlier `pip freeze` snapshot:
 #   * tensorflow-cpu  instead of  tensorflow      (drops CUDA bindings, ~370 MB)
@@ -33,14 +33,13 @@ PyMuPDF==1.27.2.3
 # --- Inference runtimes ---------------------------------------------------
 onnxruntime==1.20.1
 # Keras dropped at 1.1.0 — car classifier now uses ONNX (see onnx_inference.py).
-# tensorflow-cpu still ships tf.keras as a fallback for any future .keras
-# artefact, and the ANPR SavedModel is a tf.saved_model.
+# tensorflow-cpu still ships tf.keras as a fallback for any legacy .keras
+# card/car artefact (see poc_api keras import + card_inference.py).
 tensorflow-cpu==2.20.0
 
-# --- OCR + ANPR stack -----------------------------------------------------
+# --- OCR stack ------------------------------------------------------------
 opencv-python-headless==4.13.0.92
-paddleocr==3.6.0
-paddlepaddle==3.3.1
+rapidocr>=3.5.0
 
 # --- Arabic text shaping (OCR helper) -------------------------------------
 arabic-reshaper>=3,<4

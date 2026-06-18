@@ -34,6 +34,13 @@ docker-build.log
 reports/
 *.log
 
+# Local test data / verification scratch (never commit — large / regenerable)
+*.zip
+vlm_check/
+eval_full/
+eval_*/
+verify_*/
+
 # Local environment files
 .env
 .env.local

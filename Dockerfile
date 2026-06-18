@@ -87,22 +87,22 @@ COPY --chown=${APP_UID}:${APP_GID} . /app
 #   /home/upsure/.paddleocr, /home/upsure/.paddlex
 #                — PaddleOCR/PaddleX cache (auto-downloaded weights). The
 #                  runtime user has no shell so HOME must already exist.
-RUN mkdir -p /app/models /tmp/upsure /home/${APP_USER}/.paddleocr /home/${APP_USER}/.paddlex /app/.cache \
+RUN mkdir -p /app/models /tmp/upsure /home/${APP_USER}/.rapidocr /app/.cache \
  && chown -R ${APP_UID}:${APP_GID} /app /tmp/upsure /home/${APP_USER}
 
-ENV HOME=/home/${APP_USER} \
-    PADDLE_PDX_CACHE_HOME=/home/${APP_USER}/.paddlex
+ENV HOME=/home/${APP_USER}
 
-# Pre-warm PaddleOCR's auto-downloaded weights (~150 MB) into the image so
-# the first OCR request doesn't pay 20-30 s of network cost. We do this as
-# the runtime user so file permissions match. Skip with --build-arg
-# PREWARM_PADDLE=0 if you'd rather keep the image lean.
-ARG PREWARM_PADDLE=1
-RUN if [ "${PREWARM_PADDLE}" = "1" ]; then \
-        echo "Pre-warming PaddleOCR weights..." && \
+# Pre-warm RapidOCR model weights (~20 MB) so the first OCR request doesn't
+# pay download cost. Skip with --build-arg PREWARM_OCR=0 to keep the image lean.
+ARG PREWARM_OCR=1
+RUN if [ "${PREWARM_OCR}" = "1" ]; then \
+        echo "Pre-warming RapidOCR weights..." && \
         chown -R ${APP_UID}:${APP_GID} /home/${APP_USER} && \
-        su -s /bin/sh -c "HOME=/home/${APP_USER} python -c 'from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang=\"en\"); PaddleOCR(use_angle_cls=True, lang=\"ar\")'" ${APP_USER} || \
-            echo "WARNING: PaddleOCR pre-warm failed; first OCR request will be slow." ; \
+        su -s /bin/sh -c "HOME=/home/${APP_USER} python -c '\
+from rapidocr import RapidOCR, LangRec; \
+e=RapidOCR(); print(\"RapidOCR EN ready\"); \
+e2=RapidOCR(params={\"Rec.lang_type\": LangRec.ARABIC}); print(\"RapidOCR AR ready\")'" ${APP_USER} || \
+            echo "WARNING: RapidOCR pre-warm failed; first OCR request will be slow." ; \
     fi
 
 USER ${APP_UID}:${APP_GID}

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import inspect
 import json
 import re
 import sys
@@ -60,11 +59,13 @@ def _normalize_lines(result: object) -> list:
         mapped = from_mapping(first)
         if mapped:
             return mapped
-        # Some versions may return a flat list of [box, (text, conf)] entries.
+        # Some versions may return a flat list of [box, (text, conf)] entries
+        # where (text, conf) is a tuple (not a list). Narrowed to tuple to
+        # avoid ambiguity with our RapidOCR wrapper output.
         if (
             isinstance(first, (list, tuple))
             and len(first) == 2
-            and isinstance(first[1], (list, tuple))
+            and isinstance(first[1], tuple)
             and len(first[1]) == 2
         ):
             return result
@@ -75,46 +76,28 @@ def _normalize_lines(result: object) -> list:
     return []
 
 
-def _build_paddleocr_kwargs(args: argparse.Namespace, paddleocr_cls: object) -> dict:
-    params = inspect.signature(paddleocr_cls).parameters
-
-    if "text_recognition_batch_size" in params:
-        kwargs = {
-            "lang": args.lang,
-            "use_doc_orientation_classify": False,
-            "use_doc_unwarping": False,
-            "use_textline_orientation": args.use_angle_cls,
-            "enable_mkldnn": args.enable_mkldnn,
-            "cpu_threads": args.cpu_threads,
-            "text_recognition_batch_size": args.rec_batch_num,
-            "textline_orientation_batch_size": args.cls_batch_num,
-            "text_det_limit_side_len": args.det_limit_side_len,
-        }
-        kwargs["device"] = f"gpu:{args.gpu_id}" if args.use_gpu else "cpu"
-        return kwargs
-
-    return {
-        "use_angle_cls": args.use_angle_cls,
-        "lang": args.lang,
-        "use_gpu": args.use_gpu,
-        "gpu_id": args.gpu_id,
-        "enable_mkldnn": args.enable_mkldnn,
-        "cpu_threads": args.cpu_threads,
-        "rec_batch_num": args.rec_batch_num,
-        "cls_batch_num": args.cls_batch_num,
-        "det_limit_side_len": args.det_limit_side_len,
-        "show_log": False,
-    }
+def _create_ocr_engine():
+    from rapidocr import RapidOCR
+    return RapidOCR()
 
 
-def _run_paddle_ocr(ocr: object, image: object, *, use_angle_cls: bool) -> object:
-    predict = getattr(ocr, "predict", None)
-    if callable(predict):
-        params = inspect.signature(predict).parameters
-        if "use_textline_orientation" in params:
-            return predict(image, use_textline_orientation=use_angle_cls)
+def _create_arabic_ocr_engine():
+    from rapidocr import RapidOCR, LangRec
+    return RapidOCR(params={"Rec.lang_type": LangRec.ARABIC})
 
-    return ocr.ocr(image, cls=use_angle_cls)
+
+def _run_ocr(engine, image, *, use_cls: bool = True):
+    """Run RapidOCR v3 and return output in PaddleOCR 2.x-compatible format."""
+    result = engine(image, use_cls=use_cls)
+    if result is None or not result.txts:
+        return [[]]
+    lines = []
+    boxes = getattr(result, "boxes", None)
+    for i, (txt, conf) in enumerate(zip(result.txts, result.scores)):
+        box = boxes[i].tolist() if boxes is not None and i < len(boxes) else None
+        if box is not None:
+            lines.append([box, (str(txt), float(conf))])
+    return [lines]
 
 
 def _get_annotation_font(font_size: int):
@@ -456,6 +439,78 @@ def _validate_and_note_data(data: dict) -> None:
         data["validation_notes"] = notes
 
 
+def _assess_extraction_quality(data: dict) -> dict:
+    """Decide whether the result is good enough to accept, or the user should
+    re-capture the image.
+
+    Pixel-blur (Laplacian variance) and OCR confidence both proved UNRELIABLE as
+    quality signals on real Mulkiya photos: a clean scan scored the lowest blur
+    variance of all, and RapidOCR reports high confidence even on rotated/garbled
+    text. The only reliable signal is the EXTRACTION OUTCOME — how many critical
+    fields came out in a valid form. This counts them.
+
+    Returns {usable, valid_field_count, document_type, reason, message}.
+    """
+    doc_type = data.get("document_type", "other")
+
+    def valid_vin(v) -> bool:
+        if not isinstance(v, str):
+            return False
+        v = v.upper()
+        return bool(re.fullmatch(r"[A-HJ-NPR-Z0-9]{11,20}", v)) and bool(re.search(r"[A-Z]", v)) and bool(re.search(r"\d", v))
+
+    def valid_plate(v) -> bool:
+        if v in (None, ""):
+            return False
+        d = re.sub(r"\D", "", str(v))
+        return 3 <= len(d) <= 7
+
+    def in_range(v, lo, hi) -> bool:
+        try:
+            return lo <= int(v) <= hi
+        except (TypeError, ValueError):
+            return False
+
+    def valid_date(v) -> bool:
+        return isinstance(v, str) and bool(re.fullmatch(r"\d{2,4}/\d{1,2}/\d{1,2}", v))
+
+    checks = {
+        "vin": valid_vin(data.get("vin_or_chassis")),
+        "plate": valid_plate(data.get("plate_number")),
+        "engine_cc": in_range(data.get("engine_cc"), 200, 10000),
+        "weight": in_range(data.get("empty_weight_kg"), 100, 10000) or in_range(data.get("max_load_kg"), 100, 100000),
+        "year": in_range(data.get("year"), 1980, 2030),
+        "issue_date": valid_date(data.get("issue_date")),
+        "expiry_date": valid_date(data.get("expiry_date")),
+        "vehicle_type": data.get("vehicle_type") not in (None, ""),
+    }
+    valid_count = sum(1 for v in checks.values() if v)
+
+    # Thresholds: a real readable Mulkiya front yields well over 4 valid fields.
+    MIN_VALID = 4
+
+    if doc_type == "driving_licence":
+        usable, reason = False, "not_a_mulkiya"
+        message = "This looks like a driving licence, not a Mulkiya. Please upload the front of the vehicle registration card."
+    elif doc_type != "mulkiya":
+        usable, reason = False, "not_a_mulkiya"
+        message = "This does not appear to be a Mulkiya. Please upload a clear photo of the front of the vehicle registration card."
+    elif valid_count < MIN_VALID:
+        usable, reason = False, "low_quality"
+        message = "The image is not clear enough to read the Mulkiya reliably. Please retake a sharp, well-lit, flat photo of the whole card."
+    else:
+        usable, reason, message = True, "ok", None
+
+    return {
+        "usable": usable,
+        "valid_field_count": valid_count,
+        "document_type": doc_type,
+        "reason": reason,
+        "message": message,
+        "field_checks": checks,
+    }
+
+
 def _group_ocr_lines_by_field(lines: list[str]) -> dict[str, list[str]]:
     """Group OCR lines by detected field labels (Arabic labels often appear inline).
 
@@ -579,6 +634,43 @@ def _sort_lines(lines: list, rtl: bool) -> list:
         sorted_items.extend([it for (it, *_rest) in row_items])
 
     return sorted_items
+
+
+def _detect_document_type(lines: list[str], has_vehicle_specs: bool = False) -> str:
+    """Classify the OCR'd document by anchor strings + a field fingerprint.
+
+    The card/non-card model passes driving licences (a licence IS a card) and
+    the mulkiya model only tells front-from-back, so neither rejects a
+    non-Mulkiya document. This anchor gate does: a genuine Omani Mulkiya front
+    always carries "MOTOR VEHICLE LICENSE" / "رخصة مركبة" / "نوع اللوحة";
+    a driving licence carries "DRIVING LICENCE" / "LICENCE NUMBER" / "رخصة سياقة".
+
+    Anchor text alone is brittle — the English pass misses Arabic-only anchors,
+    so a real Mulkiya can read as "other". `has_vehicle_specs` is the safety net:
+    engine displacement / kerb weight / max load simply do not exist on a licence
+    or ID card, so their presence means this IS a vehicle registration regardless
+    of whether the header text was recognised.
+
+    Returns "mulkiya", "driving_licence", or "other". When a frame contains both
+    (e.g. a licence photographed next to a Mulkiya), Mulkiya wins so the
+    registration is still processed.
+    """
+    joined = " ".join(lines)
+    latin = re.sub(r"[^A-Za-z]", "", joined).upper()
+
+    mulkiya_latin = "MOTORVEHICLELIC" in latin
+    mulkiya_ar = any(a in joined for a in ("رخصة مركبة", "مركبة رخصة", "نوع اللوحة", "رقم اللوحة"))
+    licence_latin = any(a in latin for a in ("DRIVINGLICENCE", "DRIVINGLICENSE", "VEHICLEDRIVING", "LICENCENUMBER", "LICENSENUMBER"))
+    licence_ar = any(a in joined for a in ("رخصة سياقة", "سياقة رخصة", "رخصة قيادة"))
+
+    is_mulkiya = mulkiya_latin or mulkiya_ar or has_vehicle_specs
+    is_licence = licence_latin or licence_ar
+
+    if is_mulkiya:
+        return "mulkiya"
+    if is_licence:
+        return "driving_licence"
+    return "other"
 
 
 def _extract_mulkya_rulebased(lines: list[str]) -> dict:
@@ -821,11 +913,29 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
             make = brand
             break
     model = None
-    for mdl in ["كورولا", "كامري", "يارس", "ألتِيما", "التيما", "صني"]:
+    for mdl in ["كورولا", "كامري", "يارس", "ألتِيما", "التيما", "صني", "باترول",
+                "لاندكروزر", "برادو", "اكورد", "سيفيك", "النترا", "سوناتا"]:
         if mdl in joined:
             model = mdl
             break
-    color = find_after("اللون")
+    # Color: match a known value as a substring of any line FIRST — the value
+    # often shares a line with its label (e.g. "رمادي اللون"). find_after()
+    # alone returns the *next* line, which is usually another field's label.
+    _known_colors = ["أبيض", "ابيض", "أسود", "اسود", "أحمر", "احمر", "أزرق", "ازرق",
+                     "أخضر", "اخضر", "رمادي", "فضي", "ذهبي", "بيج", "أصفر", "اصفر",
+                     "بني", "برتقالي", "بنفسجي", "وردي"]
+    color = None
+    for ln in lines:
+        for col in _known_colors:
+            if col in ln:
+                color = col
+                break
+        if color:
+            break
+    if color is None:
+        cand = find_after("اللون")
+        if cand and not is_field_label(cand):
+            color = cand
     country_of_origin = None
     if "الولايات" in joined and ("المتحدة" in joined or "الامريكية" in joined):
         country_of_origin = "الولايات المتحدة الامريكية"
@@ -840,8 +950,11 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
 
     year = None
     model_year = None
+    # "سنة الصنع" (year of manufacture). RapidOCR garbles the label
+    # inconsistently (الصعنع / الصلع), so match several observed variants.
+    _manufacture_labels = ("الصنع", "الصلع", "الصعنع", "لصنع", "صنع")
     for i, ln in enumerate(lines):
-        if any(label in ln for label in ("الصنع", "الصلع")):
+        if any(label in ln for label in _manufacture_labels):
             for j in range(max(0, i - 1), min(i + 5, len(lines))):
                 m = re.search(r"\b\d{4}\b|\b0?\d{2,3}\b", lines_ascii[j])
                 if not m:
@@ -909,7 +1022,17 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
         else:
             expiry_date = dates[-1]
 
+    # Vehicle-spec fingerprint: these fields exist on a Mulkiya but not on a
+    # driving licence / ID, so they rescue real Mulkiyas whose Arabic-only
+    # header anchors the English OCR pass didn't read.
+    has_vehicle_specs = any(v is not None for v in (engine_cc, empty_weight_kg, max_load_kg)) or (
+        seats is not None and vehicle_type is not None
+    )
+    document_type = _detect_document_type(lines, has_vehicle_specs=has_vehicle_specs)
+
     return {
+        "document_type": document_type,
+        "is_mulkiya": document_type == "mulkiya",
         "plate_number": plate_number,
         "plate_text": plate_text,
         "vehicle_type": vehicle_type,
@@ -1183,6 +1306,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="PDF only: if a text layer exists on a page, use it instead of OCR (much faster)",
     )
+    parser.add_argument(
+        "--make_crop",
+        action="store_true",
+        help=(
+            "Image only: detect/deskew/orient the Mulkiya card and write "
+            "<stem>_cropped.jpg, then exit (no extraction). Used as a quality "
+            "fallback: re-run extraction on the crop when the original is unusable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1197,14 +1329,27 @@ def main() -> None:
     if not input_path.exists():
         raise SystemExit(f"Input not found: {input_path}")
 
+    if args.make_crop:
+        if input_path.suffix.lower() == ".pdf":
+            raise SystemExit("--make_crop is image-only.")
+        import cv2
+        import card_crop
+        img = cv2.imread(str(input_path))
+        if img is None:
+            raise SystemExit(f"Could not read image: {input_path}")
+        crop, reason = card_crop.choose_mulkiya_crop(img)
+        out_crop = input_path.with_name(f"{input_path.stem}_cropped.jpg")
+        cv2.imwrite(str(out_crop), crop)
+        print(f"Crop written to: {out_crop}  [{reason}]")
+        return
+
     if args.translate_to_en:
         _preload_argos_translate()
 
     import cv2
     import numpy as np
-    from paddleocr import PaddleOCR
 
-    ocr = PaddleOCR(**_build_paddleocr_kwargs(args, PaddleOCR))
+    engine = _create_ocr_engine()
 
     # ------------------------------------------------------------------
     # postprocess() — call this on every raw OCR text string right after
@@ -1360,11 +1505,7 @@ def main() -> None:
                             img = img[:, :, :3]
 
                         image_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                        result = _run_paddle_ocr(
-                            ocr,
-                            image_bgr,
-                            use_angle_cls=args.use_angle_cls,
-                        )
+                        result = _run_ocr(engine, image_bgr, use_cls=args.use_angle_cls)
                         raw_lines = _normalize_lines(result)
 
                         # ── POST-PROCESS every OCR line right after detection ──
@@ -1505,7 +1646,7 @@ def main() -> None:
     write_benchmark = args.write_benchmark
 
     t0 = time.perf_counter()
-    result = _run_paddle_ocr(ocr, str(image_path), use_angle_cls=args.use_angle_cls)
+    result = _run_ocr(engine, str(image_path), use_cls=args.use_angle_cls)
     raw_lines = _normalize_lines(result)
     if not raw_lines:
         print("No text detected.")
@@ -1593,10 +1734,7 @@ def main() -> None:
         aux_ocr_lang = None
         if is_arabic and any(data.get(field) in (None, "") for field in critical_fields):
             try:
-                aux_args = argparse.Namespace(**vars(args))
-                aux_args.lang = "en"
-                aux_ocr = PaddleOCR(**_build_paddleocr_kwargs(aux_args, PaddleOCR))
-                aux_result = _run_paddle_ocr(aux_ocr, str(image_path), use_angle_cls=args.use_angle_cls)
+                aux_result = _run_ocr(engine, str(image_path), use_cls=args.use_angle_cls)
                 aux_raw_lines = _normalize_lines(aux_result)
                 aux_lines = [
                     (
@@ -1629,8 +1767,45 @@ def main() -> None:
                 if isinstance(data["validation_notes"], list):
                     data["validation_notes"].append(f"auxiliary_ocr_failed: {exc}")
 
+        # Fields the Arabic pass extracts better because their VALUE sits next
+        # to an Arabic LABEL (the English pass sees only bare numbers/text with
+        # no label to bind to).
+        # Fields the Arabic pass extracts better because their VALUE sits next
+        # to an Arabic LABEL (the English pass sees only bare text with no label
+        # to bind to). Numeric fields are intentionally NOT merged from Arabic:
+        # the Arabic recogniser fragments digits worse than the English one, so
+        # an Arabic-bound number is usually less accurate than the English read.
+        arabic_text_fields = ("vehicle_type", "make", "model", "color", "country_of_origin")
+        if not is_arabic and any(data.get(field) in (None, "") for field in arabic_text_fields):
+            try:
+                ara_engine = _create_arabic_ocr_engine()
+                ara_result = _run_ocr(ara_engine, str(image_path), use_cls=args.use_angle_cls)
+                ara_raw_lines = _normalize_lines(ara_result)
+                ara_lines = [
+                    (box, (_fix_reversed_arabic_runs(text), conf))
+                    for box, (text, conf) in ara_raw_lines
+                ]
+                ara_ordered: list[str] = []
+                for _box, (text, confidence) in _sort_lines(ara_lines, rtl=True):
+                    if float(confidence) >= args.min_conf:
+                        nt = _normalize_for_translation(text)
+                        if nt:
+                            ara_ordered.append(nt)
+                if ara_ordered:
+                    ara_data = _extract_mulkya_rulebased(ara_ordered)
+                    for field in arabic_text_fields:
+                        if data.get(field) in (None, "") and ara_data.get(field) not in (None, ""):
+                            data[field] = ara_data[field]
+                    if any(data.get(f) not in (None, "") for f in arabic_text_fields):
+                        aux_ocr_lang = (aux_ocr_lang + "+ar") if aux_ocr_lang else "ar"
+            except Exception as exc:
+                data.setdefault("validation_notes", [])
+                if isinstance(data["validation_notes"], list):
+                    data["validation_notes"].append(f"auxiliary_arabic_ocr_failed: {exc}")
+
         # Validate extracted data and add any inconsistency notes.
         _validate_and_note_data(data)
+        data["quality"] = _assess_extraction_quality(data)
 
         data.setdefault("source", {})
         if isinstance(data["source"], dict):

@@ -160,7 +160,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "health",
             "predict-car",
             "predict-damage",
-            "predict-anpr",
             "process-car",
             "process-mulkiya",
             "process-pdf",
@@ -227,7 +226,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-lang",
-        default="ar",
+        default="en",
         help="OCR language form field passed to process_type=mulkiya and process_type=pdf.",
     )
     parser.add_argument(
@@ -237,8 +236,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-json", default=None, help="Optional path to write the raw benchmark results as JSON.")
     parser.add_argument("--skip-standalone", action="store_true", help="Skip benchmarking the standalone car API.")
-    parser.add_argument("--anpr-file", type=Path, default=None,
-                        help="Image for /predict/damage (front-only) ANPR benchmark. Defaults to --front-file or car sample.")
     parser.add_argument("--front-file", type=Path, default=None,
                         help="Front view image for /predict/damage benchmark.")
     parser.add_argument("--back-file",  type=Path, default=None,
@@ -586,7 +583,7 @@ def _print_summary(summary: dict[str, Any]) -> None:
 def _selected_scenarios(args: argparse.Namespace) -> set[str]:
     requested = set(args.scenario or ["all"])
     if "all" in requested:
-        requested.update({"health", "predict-car", "predict-damage", "predict-anpr", "process-car", "process-mulkiya", "process-pdf"})
+        requested.update({"health", "predict-car", "predict-damage", "process-car", "process-mulkiya", "process-pdf"})
         if not args.skip_standalone:
             requested.add("standalone-car")
     if args.skip_standalone:
@@ -660,29 +657,16 @@ def main() -> int:
         ),
         Scenario(
             "predict-damage",
-            "Unified POST /predict/damage (4 views, damage+ANPR parallel)",
+            "Unified POST /predict/damage (4 views)",
             lambda: (
                 lambda chosen: _send_damage_post(
                     f"{unified_base}/predict/damage",
                     args.timeout,
-                    "Unified POST /predict/damage (4 views, damage+ANPR parallel)",
+                    "Unified POST /predict/damage (4 views)",
                     chosen[0],
                     chosen[1],
                 )
             )(pick_damage_views()),
-        ),
-        Scenario(
-            "predict-anpr",
-            "Unified POST /predict/damage (front-only, ANPR+damage isolation)",
-            lambda: (
-                lambda anpr_path, fmt: _send_damage_post(
-                    f"{unified_base}/predict/damage",
-                    args.timeout,
-                    "Unified POST /predict/damage (front-only, ANPR+damage isolation)",
-                    {"front": anpr_path},
-                    {"front": fmt},
-                )
-            )(*pick_upload("front", args.anpr_file or args.front_file)),
         ),
         Scenario(
             "process-car",
@@ -781,7 +765,6 @@ def main() -> int:
             "car": str(args.car_file) if args.car_file else None,
             "mulkiya": str(args.mulkiya_file) if args.mulkiya_file else None,
             "pdf": str(args.pdf_file) if args.pdf_file else None,
-            "anpr": str(args.anpr_file) if args.anpr_file else None,
             "front": str(args.front_file) if args.front_file else None,
             "back": str(args.back_file) if args.back_file else None,
             "left": str(args.left_file) if args.left_file else None,

@@ -8,7 +8,7 @@ Public endpoints (unchanged paths, new wrapped envelope):
 * ``GET  /readyz``               — k8s readiness probe (200 only when models ready)
 * ``GET  /metrics``              — Prometheus scrape endpoint
 * ``POST /predict/``             — car classification
-* ``POST /predict/damage``       — damage detection + parallel ANPR
+* ``POST /predict/damage``       — damage detection
 * ``POST /api/v1/process``       — unified document/image processing
 
 Response envelope (all routes):
@@ -89,29 +89,6 @@ configure_logging()
 log = get_logger("upsure.api")
 
 try:
-    from plate_pipeline import (
-        get_model as _get_anpr_model,
-        get_reader as _get_anpr_reader,
-        run_pipeline as _run_anpr_pipeline,
-    )
-    _ANPR_AVAILABLE = True
-except Exception as _anpr_import_exc:
-    _ANPR_AVAILABLE = False
-    log.warning(
-        "plate_pipeline import failed; ANPR disabled",
-        extra={"event": "anpr.import_failed", "exception": repr(_anpr_import_exc)},
-    )
-
-    def _get_anpr_model():  # type: ignore[misc]
-        raise RuntimeError("plate_pipeline not importable")
-
-    def _get_anpr_reader():  # type: ignore[misc]
-        raise RuntimeError("plate_pipeline not importable")
-
-    def _run_anpr_pipeline(img_bytes: bytes, **kwargs) -> dict:  # type: ignore[misc]
-        raise RuntimeError("plate_pipeline not importable")
-
-try:
     from keras.models import load_model as load_keras_model
 except ImportError:
     try:
@@ -180,6 +157,22 @@ def _resolve_car_model_path() -> Path:
 
 
 CAR_MODEL_PATH = _resolve_car_model_path()
+
+_MULKIYA_MODEL_CANDIDATES = [
+    "models/digiLifeDoc_mulkiya_classifier_model.onnx",
+    "models/mulkiya_classifier_model.onnx",
+]
+
+
+def _resolve_mulkiya_model_path() -> Path | None:
+    for candidate in _MULKIYA_MODEL_CANDIDATES:
+        path = POC_DIR / candidate
+        if path.exists():
+            return path
+    return None
+
+
+MULKIYA_MODEL_PATH = _resolve_mulkiya_model_path()
 
 
 def _env_float_top(name: str, default: float) -> float:
@@ -294,8 +287,6 @@ def _resolve_yolo_model_path() -> Path:
 
 
 YOLO_MODEL_PATH = _resolve_yolo_model_path()
-ANPR_MODEL_PATH = POC_DIR / "models" / "anpr_plate_detector"
-ANPR_VIEW_PRIORITY = ["front", "back", "left", "right"]
 
 
 # Rule tables (unchanged business logic)
@@ -362,12 +353,6 @@ OCR_CB = CircuitBreaker(
     half_open_max_calls=SETTINGS.cb_half_open_max_calls,
     ignored_exceptions=(ValidationError, UnsupportedMediaError),
 )
-ANPR_CB = CircuitBreaker(
-    name="anpr_pipeline",
-    failure_threshold=SETTINGS.cb_failure_threshold,
-    recovery_seconds=SETTINGS.cb_recovery_seconds,
-    half_open_max_calls=SETTINGS.cb_half_open_max_calls,
-)
 YOLO_CB = CircuitBreaker(
     name="yolo_damage",
     failure_threshold=SETTINGS.cb_failure_threshold,
@@ -381,7 +366,7 @@ DAMAGE_CB = CircuitBreaker(
     half_open_max_calls=SETTINGS.cb_half_open_max_calls,
 )
 
-_CIRCUITS: tuple[CircuitBreaker, ...] = (OCR_CB, ANPR_CB, YOLO_CB, DAMAGE_CB)
+_CIRCUITS: tuple[CircuitBreaker, ...] = (OCR_CB, YOLO_CB, DAMAGE_CB)
 
 
 # ── Bulkheads ──────────────────────────────────────────────────────────────
@@ -395,6 +380,7 @@ _car_model: Any | None = None
 _car_img_size = CAR_FALLBACK_SIZE
 _damage_session: ort.InferenceSession | None = None
 _yolo_session: ort.InferenceSession | None = None
+_mulkiya_classifier: BinaryOnnxImageClassifier | None = None
 
 
 @retry(attempts=3, base_delay=0.5, max_delay=4.0)
@@ -506,6 +492,25 @@ def _get_yolo_session() -> ort.InferenceSession:
         _yolo_session = _load_yolo_session()
         set_model_readiness("yolo_damage", True)
     return _yolo_session
+
+
+def _get_mulkiya_classifier() -> BinaryOnnxImageClassifier | None:
+    global _mulkiya_classifier
+    if _mulkiya_classifier is None and MULKIYA_MODEL_PATH and MULKIYA_MODEL_PATH.exists():
+        try:
+            _mulkiya_classifier = BinaryOnnxImageClassifier(
+                MULKIYA_MODEL_PATH,
+                positive_label="front",
+                negative_label="back",
+                positive_when_output_high=_env_bool("UPSURE_MULKIYA_FRONT_HIGH", True),
+            )
+            set_model_readiness("mulkiya_classifier", True)
+        except Exception as exc:
+            log.warning(
+                "mulkiya classifier load failed",
+                extra={"event": "model.mulkiya_load_failed", "exception": repr(exc)},
+            )
+    return _mulkiya_classifier
 
 
 # ── Preprocessing / inference helpers ──────────────────────────────────────
@@ -1222,6 +1227,46 @@ def _run_ocr_script(
     return completed
 
 
+def _run_make_crop(image_path: Path) -> bool:
+    """Ask the OCR worker to deskew/crop the Mulkiya card to <stem>_cropped.jpg.
+    Returns True if the crop file was produced. Best-effort; never raises."""
+    python_executable = OCR_PYTHON if OCR_PYTHON.exists() else Path(sys.executable)
+    args = [str(python_executable), str(OCR_SCRIPT), str(image_path), "--make_crop"]
+    try:
+        OCR_CB.call(_ocr_subprocess, args)
+    except Exception as exc:  # noqa: BLE001 - fallback path must not break the request
+        log.warning("make_crop failed", extra={"event": "ocr.make_crop_failed", "exception": repr(exc)})
+        return False
+    return image_path.with_name(f"{image_path.stem}_cropped.jpg").exists()
+
+
+def _quality_score(data: Any) -> int:
+    """Rank an extraction: usable dominates, then valid-field count."""
+    q = (data or {}).get("quality") if isinstance(data, dict) else None
+    q = q or {}
+    return (1000 if q.get("usable") else 0) + int(q.get("valid_field_count", 0))
+
+
+def _try_crop_fallback(image_path: Path, lang: str) -> tuple[Any, Path] | None:
+    """Deskew/crop the card and re-extract. Returns (data, mulkya_path) or None.
+
+    Crop helps the noisy tail (rotated / multi-doc frames) but regresses already
+    clean docs, so the caller only invokes this when the original extraction
+    failed the quality gate — never on a doc that already read well."""
+    if not _run_make_crop(image_path):
+        return None
+    crop_path = image_path.with_name(f"{image_path.stem}_cropped.jpg")
+    try:
+        _run_ocr_script(crop_path, lang=lang, extract_mulkya=True, is_pdf=False, prefer_pdf_text=False)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("crop re-extract failed", extra={"event": "ocr.crop_extract_failed", "exception": repr(exc)})
+        return None
+    crop_mulkya = crop_path.with_name(f"{crop_path.stem}_mulkya.json")
+    if not crop_mulkya.exists():
+        return None
+    return _load_json(crop_mulkya), crop_mulkya
+
+
 def _load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -1411,7 +1456,7 @@ async def lifespan(app: FastAPI):
     set_model_readiness("yolo_damage", False)
     set_model_readiness("car_classifier", False)
     set_model_readiness("card_noncard", False)
-    set_model_readiness("anpr", False)
+    set_model_readiness("mulkiya_classifier", False)
 
     log.info(
         "service starting",
@@ -1457,7 +1502,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=f"UpSure {SETTINGS.service_name}",
     version=SETTINGS.service_version,
-    description="Production data-ingestion API for vehicle, OCR, damage, and ANPR workflows.",
+    description="Production data-ingestion API for vehicle, OCR, and damage workflows.",
     lifespan=lifespan,
 )
 
@@ -1525,29 +1570,6 @@ def _check_car_model() -> ComponentStatus:
         return ComponentStatus("car_classifier", False, critical=False, detail=str(exc), extra={"path": str(CAR_MODEL_PATH)})
 
 
-def _check_anpr_model() -> ComponentStatus:
-    if not _ANPR_AVAILABLE:
-        return ComponentStatus(
-            "anpr", False, critical=False,
-            detail="plate_pipeline module not importable",
-            extra={"path": str(ANPR_MODEL_PATH)},
-        )
-    if not ANPR_MODEL_PATH.exists():
-        return ComponentStatus(
-            "anpr", False, critical=False,
-            detail=f"ANPR model directory not found",
-            extra={"path": str(ANPR_MODEL_PATH)},
-        )
-    try:
-        _get_anpr_model()
-        _get_anpr_reader()
-        set_model_readiness("anpr", True)
-        return ComponentStatus("anpr", True, critical=False, extra={"path": str(ANPR_MODEL_PATH)})
-    except Exception as exc:
-        set_model_readiness("anpr", False)
-        return ComponentStatus("anpr", False, critical=False, detail=str(exc), extra={"path": str(ANPR_MODEL_PATH)})
-
-
 def _check_card_model() -> ComponentStatus:
     global _card_model
     if _card_model is not None:
@@ -1585,7 +1607,6 @@ health_registry.register("damage_binary", _check_damage_model)
 health_registry.register("yolo_damage", _check_yolo_model)
 health_registry.register("car_classifier", _check_car_model)
 health_registry.register("card_noncard", _check_card_model)
-health_registry.register("anpr", _check_anpr_model)
 health_registry.register("circuits", _check_circuits)
 
 
@@ -1726,7 +1747,12 @@ async def process_document(
     file: UploadFile = File(...),
     process_type: Literal["car", "mulkiya", "pdf", "file"] = Form(...),
     card_threshold: float = Form(0.5),
-    ocr_lang: str = Form("ar"),
+    # English primary recognition + Arabic auxiliary pass extracts both the
+    # numeric fields (plate/VIN/cc/weights/dates) and the Arabic text fields
+    # (make/model/color/vehicle_type). Batch-verified on 30 real fronts: an
+    # "ar" primary leaves all Arabic text fields at 0% fill; "en" recovers them
+    # with identical numeric accuracy. See verify_mulkiya_batch.py.
+    ocr_lang: str = Form("en"),
     prefer_pdf_text: bool = Form(False),
     skip_ocr: bool = Form(False),
     translate_to_en: bool = Form(False),
@@ -1831,12 +1857,31 @@ async def process_document(
                     "threshold": card_threshold,
                 }
                 confidence_score = probability
+
+                mulkiya_side: dict[str, Any] | None = None
+                side_classifier = _get_mulkiya_classifier()
+                if side_classifier is not None:
+                    try:
+                        side_result = side_classifier.classify(image, threshold=0.5)
+                        mulkiya_side = {
+                            "side": side_result["label"],
+                            "confidence": side_result["confidence"],
+                            "front_probability": side_result.get("front_probability", 0.0),
+                            "back_probability": side_result.get("back_probability", 0.0),
+                        }
+                    except Exception as exc:
+                        log.warning(
+                            "mulkiya front/back classification failed",
+                            extra={"event": "mulkiya.side_failed", "exception": repr(exc)},
+                        )
+                classification["mulkiya_side"] = mulkiya_side
             else:
                 model_input = None
                 classification = {
                     "label": "unknown",
                     "reason": "PDF Mulkiya classification requires OCR.",
                     "threshold": card_threshold,
+                    "mulkiya_side": None,
                 }
                 confidence_score = 0.0
 
@@ -1884,8 +1929,46 @@ async def process_document(
 
             if extracted_data_path.exists():
                 extracted_data = _load_json(extracted_data_path)
-                chunk_source_path = extracted_data_path
                 note = "Mulkiya pipeline executed with card inference and OCR extraction."
+                # Quality-triggered crop fallback: if the original extraction is
+                # not usable and this is an image, deskew/crop the card and retry.
+                # Crop rescues the noisy tail (rotated / multi-doc) but regresses
+                # clean docs, so it only fires on a quality-gate failure.
+                if (
+                    not is_pdf_file
+                    and isinstance(extracted_data, dict)
+                    and not (extracted_data.get("quality") or {}).get("usable", True)
+                ):
+                    crop_res = _try_crop_fallback(ocr_input.path, ocr_lang)
+                    if crop_res is not None and _quality_score(crop_res[0]) > _quality_score(extracted_data):
+                        extracted_data, extracted_data_path = crop_res
+                        note = "Mulkiya extracted from deskewed/cropped card (quality fallback)."
+                chunk_source_path = extracted_data_path
+                # Anchor gate: the OCR extractor reports document_type from
+                # anchor strings. Surface it so callers can reject a document
+                # that is not actually a Mulkiya (e.g. a driving licence, which
+                # the card/non-card model passes because a licence is a card).
+                if isinstance(extracted_data, dict):
+                    doc_type = extracted_data.get("document_type")
+                    classification["document_type"] = doc_type
+                    classification["is_mulkiya"] = extracted_data.get("is_mulkiya")
+                    # Quality gate: surface a clear accept/re-capture decision.
+                    # Outcome-based (valid critical-field count) — pixel blur and
+                    # OCR confidence proved unreliable on real Mulkiya photos.
+                    quality = extracted_data.get("quality") or {}
+                    classification["quality"] = quality
+                    classification["accepted"] = bool(quality.get("usable", True))
+                    if quality and not quality.get("usable", True):
+                        classification["recapture_required"] = True
+                        classification["recapture_message"] = quality.get("message")
+                        note = quality.get("message") or (
+                            f"OCR indicates this is a '{doc_type}', not a usable Mulkiya. Re-capture required."
+                        )
+                    elif doc_type and doc_type != "mulkiya":
+                        note = (
+                            f"OCR anchors indicate this is a '{doc_type}', not a Mulkiya. "
+                            "Extracted fields are unreliable; reject or re-capture."
+                        )
             else:
                 extracted_data = {"lines": _flatten_ocr_lines(raw_ocr)}
                 chunk_source_path = ocr_json_path
@@ -2038,26 +2121,6 @@ def _damage_batch_for_views(
     return out
 
 
-def _anpr_for_view(img_bytes: bytes) -> dict[str, Any]:
-    try:
-        result = ANPR_CB.call(_run_anpr_pipeline, img_bytes, is_oman_plate=True)
-        return {
-            "detected":   result.get("detected", False),
-            "plate_text": result.get("plate_text", ""),
-            "confidence": result.get("confidence", 0.0),
-            "num_plates": result.get("num_plates", 0),
-        }
-    except Exception as exc:
-        log.warning(
-            "anpr failed; returning empty plate",
-            extra={"event": "anpr.failed", "exception": repr(exc)},
-        )
-        return {
-            "detected": False, "plate_text": "", "confidence": 0.0,
-            "num_plates": 0, "error": "plate detection unavailable",
-        }
-
-
 @app.post("/predict/damage")
 async def predict_damage(
     request: Request,
@@ -2116,30 +2179,18 @@ async def predict_damage(
             "total_views_analyzed": 0,
             "overall_confidence": 0.0,
             "per_view": {},
-            "plate": {"detected": False, "plate_text": "", "confidence": 0.0, "source_view": None},
             "any_view_error": False,
             "skipped_views": skipped_views,
             "message": "No car images detected. Please submit images of a vehicle.",
         }
         return json_success(payload, request=request, start_perf=request.state.start_perf)
 
-    # Phase 2: batched damage inference (single ORT call for N views)
-    # in parallel with ANPR on the priority view.
-    anpr_source_view = next((v for v in ANPR_VIEW_PRIORITY if v in view_img_bytes), None)
-    run_anpr = _ANPR_AVAILABLE and anpr_source_view is not None
-
+    # Phase 2: batched damage inference (single ORT call for N views).
     async with _damage_bulkhead:
-        damage_coro = run_in_threadpool(_damage_batch_for_views, view_img_bytes, yolo_available)
-        if run_anpr:
-            damage_batch, anpr_raw = await asyncio.gather(
-                damage_coro,
-                run_in_threadpool(_anpr_for_view, view_img_bytes[anpr_source_view]),
-                return_exceptions=True,
-            )
-        else:
-            damage_batch = await asyncio.gather(damage_coro, return_exceptions=True)
-            damage_batch = damage_batch[0]
-            anpr_raw = None
+        damage_batch, = await asyncio.gather(
+            run_in_threadpool(_damage_batch_for_views, view_img_bytes, yolo_available),
+            return_exceptions=True,
+        )
 
     # Aggregate damage results
     per_view: dict[str, Any] = {}
@@ -2170,15 +2221,6 @@ async def predict_damage(
                 if score > max_confidence:
                     max_confidence = score
 
-    # Build plate result
-    plate: dict[str, Any] = {"detected": False, "plate_text": "", "confidence": 0.0, "source_view": None}
-    if anpr_raw is not None and not isinstance(anpr_raw, Exception):
-        plate = {**anpr_raw, "source_view": anpr_source_view}
-    elif isinstance(anpr_raw, Exception):
-        plate["error"] = "plate detection unavailable"
-    elif not _ANPR_AVAILABLE:
-        plate["error"] = "ANPR module not available"
-
     record_pipeline_latency("predict_damage", time.perf_counter() - pipeline_start)
 
     payload = {
@@ -2186,7 +2228,6 @@ async def predict_damage(
         "total_views_analyzed": len(per_view),
         "overall_confidence":   round(max_confidence, 4),
         "per_view":             per_view,
-        "plate":                plate,
         "any_view_error":       any_per_view_error,
         "skipped_views":        skipped_views,
     }

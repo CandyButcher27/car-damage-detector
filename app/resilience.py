@@ -294,9 +294,8 @@ def safe_call(
 ) -> Any:
     """Run a callable; on whitelisted exception return ``default``.
 
-    Tiny utility for ``best-effort`` paths (e.g. ANPR on /predict/damage)
-    where the main response should succeed even if a sidecar pipeline
-    fails.
+    Tiny utility for ``best-effort`` paths where the main response should
+    succeed even if a sidecar pipeline fails.
     """
     try:
         return func(*args, **kwargs)

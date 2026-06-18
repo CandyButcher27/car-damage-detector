@@ -2,7 +2,7 @@
 
 * ``/livez``  — cheap, never blocks. Returns 200 as long as the event loop
   runs. Kubernetes will restart the pod if this fails for too long.
-* ``/readyz`` — checks every dependency (models, optional ANPR) and only
+* ``/readyz`` — checks every dependency (models) and only
   returns 200 when the pod can actually serve traffic. Kubernetes will
   pull the pod out of Service endpoints (no traffic) while this is red.
 * ``/health`` — legacy alias kept for the existing UI / scripts. Same
