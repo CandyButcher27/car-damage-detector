@@ -39,7 +39,15 @@ reports/
 vlm_check/
 eval_full/
 eval_*/
+eval/
 verify_*/
+
+# Test files (local development only)
+tests/test_spatial_extraction.py
+ocr_simple_test.py
+*_test.py
+test_*.py
+tests/**/*.pyc
 
 # Local environment files
 .env
@@ -55,3 +63,6 @@ verify_*/
 # OS
 .DS_Store
 Thumbs.db
+
+#API keys
+.env.secret

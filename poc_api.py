@@ -282,7 +282,7 @@ POLICY_DENY_RULES = {
     "glass-crack": "moderate",
     "lamp-crack": "moderate",
 }
-POLICY_IGNORE_CLASSES = {"flat-tire"}
+POLICY_IGNORE_CLASSES = {"flat-tire","general-damage"}
 GENERAL_DAMAGE_DENY_SEVERITY = "severe"
 
 
