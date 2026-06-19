@@ -1,0 +1,77 @@
+{
+  "image": "Samples/Mulkiya_front.jpg",
+  "lines": [
+    {
+      "text": "SULTANATEOFOMAN",
+      "confidence": 0.99548
+    },
+    {
+      "text": "Laeiihl",
+      "confidence": 0.61688
+    },
+    {
+      "text": "ROYALOMANPOLICE",
+      "confidence": 0.99443
+    },
+    {
+      "text": "yiuhllaeb",
+      "confidence": 0.56786
+    },
+    {
+      "text": "DIR.GENERALOFTRAFFIC",
+      "confidence": 0.94059
+    },
+    {
+      "text": "MOTORVEHICLELICENSE",
+      "confidence": 0.98155
+    },
+    {
+      "text": "52514",
+      "confidence": 0.96684
+    },
+    {
+      "text": "GL",
+      "confidence": 0.75206
+    },
+    {
+      "text": "2019",
+      "confidence": 0.9217
+    },
+    {
+      "text": "20002000",
+      "confidence": 0.94747
+    },
+    {
+      "text": "1800",
+      "confidence": 0.97688
+    },
+    {
+      "text": "2",
+      "confidence": 0.86926
+    },
+    {
+      "text": "4",
+      "confidence": 0.92539
+    },
+    {
+      "text": "2018",
+      "confidence": 0.99093
+    },
+    {
+      "text": "5YFBURHE7KP872881:()W",
+      "confidence": 0.87216
+    },
+    {
+      "text": "NIL:",
+      "confidence": 0.82676
+    },
+    {
+      "text": "2025/05/06",
+      "confidence": 0.96632
+    },
+    {
+      "text": "2024/06/02",
+      "confidence": 0.83514
+    }
+  ]
+}
