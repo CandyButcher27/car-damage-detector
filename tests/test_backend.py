@@ -318,6 +318,69 @@ def test_no_damage_returns_empty_damages_list():
     assert data["per_view"]["front"]["damages"] == []
 
 
+# ── Policy decision matrix ──────────────────────────────────────────────────
+def _pv(*damages):
+    """Build a one-view per_view dict from (type, severity) tuples."""
+    return {"front": {"damages": [{"type": t, "severity": s} for t, s in damages]}}
+
+
+@pytest.mark.parametrize("cls,severity,denies", [
+    ("scratches", "minor", False),
+    ("scratches", "moderate", False),
+    ("scratches", "severe", True),
+    ("car-part-crack", "moderate", False),
+    ("car-part-crack", "severe", True),
+    ("deformation", "minor", False),
+    ("deformation", "moderate", True),
+    ("deformation", "severe", True),
+    ("glass-crack", "minor", False),
+    ("glass-crack", "moderate", True),
+    ("lamp-crack", "minor", False),
+    ("lamp-crack", "severe", True),
+])
+def test_policy_deny_matrix(cls, severity, denies):
+    decision = poc_api._policy_decision(_pv((cls, severity)), damage_detected=True)["decision"]
+    assert decision == ("DENY" if denies else "GRANT_WITH_WARNING")
+
+
+def test_policy_flat_tire_never_denies():
+    decision = poc_api._policy_decision(_pv(("flat-tire", "severe")), damage_detected=True)
+    assert decision["decision"] == "GRANT_WITH_WARNING"
+    assert decision["deny_reasons"] == []
+
+
+def test_policy_general_damage_denies_only_when_severe():
+    assert poc_api._policy_decision(_pv(("general-damage", "moderate")), True)["decision"] == "GRANT_WITH_WARNING"
+    assert poc_api._policy_decision(_pv(("general-damage", "severe")), True)["decision"] == "DENY"
+
+
+def test_policy_deny_wins_across_views():
+    per_view = {
+        "front": {"damages": [{"type": "scratches", "severity": "minor"}]},
+        "back": {"damages": [{"type": "deformation", "severity": "moderate"}]},
+    }
+    decision = poc_api._policy_decision(per_view, damage_detected=True)
+    assert decision["decision"] == "DENY"
+    assert decision["deny_reasons"] == [{"view": "back", "class": "deformation", "severity": "moderate"}]
+
+
+def test_policy_no_damage_grants():
+    decision = poc_api._policy_decision({"front": {"damages": []}}, damage_detected=False)
+    assert decision["decision"] == "GRANT"
+    assert decision["deny_reasons"] == []
+
+
+def test_policy_decision_present_in_response():
+    with (
+        patch("poc_api._get_damage_session"),
+        patch("poc_api._run_damage_inference_batch",
+              return_value=[_mock_damage_pred(damaged=False)]),
+    ):
+        resp = client.post("/predict/damage", files={"front": _car_file()})
+    decision = ok(resp)["policy_decision"]
+    assert decision["decision"] == "GRANT"
+
+
 # ── Resilience: circuit breaker around YOLO ─────────────────────────────────
 def test_yolo_failures_open_circuit_after_threshold():
     """After ``failure_threshold`` YOLO crashes in a row, the breaker opens."""

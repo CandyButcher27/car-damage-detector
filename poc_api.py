@@ -268,6 +268,23 @@ SEVERITY_MINOR_MAX = 0.05
 SEVERITY_MODERATE_MAX = 0.15
 _CAR_BBOX = [0.5, 0.5, 1.0, 1.0]
 
+# Policy decision: which damage class+severity combinations block (DENY) a
+# policy from being issued. A damage denies if its severity rank meets or
+# exceeds the class threshold below. Classes not listed (and IGNORE classes)
+# never deny. `general-damage` (binary positive, YOLO could not localise) is
+# handled specially — it denies only at `severe`, so an unlocalised severe hit
+# is not silently granted.
+SEVERITY_RANK = {"minor": 0, "moderate": 1, "severe": 2}
+POLICY_DENY_RULES = {
+    "scratches": "severe",
+    "car-part-crack": "severe",
+    "deformation": "moderate",
+    "glass-crack": "moderate",
+    "lamp-crack": "moderate",
+}
+POLICY_IGNORE_CLASSES = {"flat-tire"}
+GENERAL_DAMAGE_DENY_SEVERITY = "severe"
+
 
 def _resolve_yolo_model_path() -> Path:
     env_path = os.getenv("UPSURE_YOLO_MODEL")
@@ -2121,6 +2138,43 @@ def _damage_batch_for_views(
     return out
 
 
+def _damage_denies(cls: str, severity: str) -> bool:
+    """Does a single damage (class + severity) block policy issuance?"""
+    if cls in POLICY_IGNORE_CLASSES:
+        return False
+    sev_rank = SEVERITY_RANK.get(severity, 0)
+    if cls == "general-damage":
+        return sev_rank >= SEVERITY_RANK[GENERAL_DAMAGE_DENY_SEVERITY]
+    threshold = POLICY_DENY_RULES.get(cls)
+    if threshold is None:
+        return False
+    return sev_rank >= SEVERITY_RANK[threshold]
+
+
+def _policy_decision(per_view: dict[str, Any], damage_detected: bool) -> dict[str, Any]:
+    """Derive the policy verdict from per-view damages.
+
+    DENY                — at least one damage matches the deny matrix.
+    GRANT_WITH_WARNING  — damage present but none deny-worthy (amber alert).
+    GRANT               — no damage.
+    """
+    deny_reasons: list[dict[str, Any]] = []
+    for view_name, vres in per_view.items():
+        for dmg in vres.get("damages", []) or []:
+            cls = dmg.get("type")
+            severity = dmg.get("severity", "minor")
+            if _damage_denies(cls, severity):
+                deny_reasons.append({"view": view_name, "class": cls, "severity": severity})
+
+    if deny_reasons:
+        decision = "DENY"
+    elif damage_detected:
+        decision = "GRANT_WITH_WARNING"
+    else:
+        decision = "GRANT"
+    return {"decision": decision, "deny_reasons": deny_reasons}
+
+
 @app.post("/predict/damage")
 async def predict_damage(
     request: Request,
@@ -2181,6 +2235,7 @@ async def predict_damage(
             "per_view": {},
             "any_view_error": False,
             "skipped_views": skipped_views,
+            "policy_decision": {"decision": "NOT_A_CAR", "deny_reasons": []},
             "message": "No car images detected. Please submit images of a vehicle.",
         }
         return json_success(payload, request=request, start_perf=request.state.start_perf)
@@ -2230,6 +2285,7 @@ async def predict_damage(
         "per_view":             per_view,
         "any_view_error":       any_per_view_error,
         "skipped_views":        skipped_views,
+        "policy_decision":      _policy_decision(per_view, overall_damaged),
     }
     return json_success(payload, request=request, start_perf=request.state.start_perf)
 
