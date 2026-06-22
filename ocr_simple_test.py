@@ -1468,7 +1468,61 @@ def _fit_template_affine(anchors: dict):
     return M
 
 
-def _extract_by_template(lines: list, image_bgr) -> dict:
+# ── Tier-1 cell refinement: preprocess + upscale + digit re-OCR ─────────────
+# Once the anchor frame is fit we know each numeric cell's pixel box. Small-font
+# digits on WhatsApp-grade photos sit below the recogniser's resolution floor at
+# full-page scale, so we crop the cell, boost contrast (CLAHE) + sharpen, upscale
+# 4x, and re-read it digit-only. A confident in-range cell read overrides the
+# full-page token bind — this attacks the residual digit MISREADS (1400->140),
+# not just blanks.
+_CELL_REFINE_ENABLED = os.getenv("UPSURE_CELL_REFINE", "1") not in ("0", "false", "False")
+# Fields worth a cell re-read: small-font numerics prone to misreads. Years are
+# excluded — a slightly-off year cell can grab an adjacent date.
+_CELL_REFINE_RANGES = {
+    "engine_cc": (600, 8999),
+    "empty_weight_kg": (100, 6000),
+    "max_load_kg": (100, 50000),
+    "seats": (1, 9),
+}
+
+
+def _preprocess_cell(cell):
+    """Grayscale + CLAHE contrast + unsharp mask, returned as 3-channel BGR.
+    Lifts faded/compressed digits before the upscale + re-OCR."""
+    import cv2
+    gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    blur = cv2.GaussianBlur(gray, (0, 0), 3)
+    sharp = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
+    return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
+
+
+def _read_cell_number(image_bgr, cx, cy, hw, hh, engine, lo, hi):
+    """Crop a numeric cell around (cx,cy), preprocess, 4x upscale, OCR, return
+    the first in-range integer (digit-only via post-filter)."""
+    import cv2
+    H, W = image_bgr.shape[:2]
+    x0 = max(0, int(cx - hw)); x1 = min(W, int(cx + hw))
+    y0 = max(0, int(cy - hh)); y1 = min(H, int(cy + hh))
+    if x1 - x0 < 6 or y1 - y0 < 6:
+        return None
+    cell = _preprocess_cell(image_bgr[y0:y1, x0:x1])
+    big = cv2.resize(cell, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    res = engine(big)
+    if res is None or not res.txts:
+        return None
+    txt = _convert_arabic_indic_digits_to_ascii(" ".join(res.txts))
+    for n in re.findall(r"\d{1,8}", txt):
+        v = int(n)
+        if lo <= v <= hi:
+            return v
+        split = _split_merged_weight(v) if lo == 100 else None  # weight cell merge
+        if split and lo <= max(split) <= hi:
+            return max(split)
+    return None
+
+
+def _extract_by_template(lines: list, image_bgr, engine=None) -> dict:
     """Bind values to fields by card-relative position (fixed Mulkiya layout).
 
     Framing: first try to fit an affine transform from the format-unique anchor
@@ -1549,10 +1603,12 @@ def _extract_by_template(lines: list, image_bgr) -> dict:
     pairs.sort(key=lambda p: p[0])
     out: dict[str, object] = {}
     used_tokens: set[int] = set()
+    bound_tok: dict[str, int] = {}  # field -> token index it bound to
     for dist, field, i, val in pairs:
         if field in out or i in used_tokens:
             continue
         out[field] = val
+        bound_tok[field] = i
         used_tokens.add(i)
 
     # Merged-weight rescue. The two weight cells are adjacent, so the detector
@@ -1596,6 +1652,26 @@ def _extract_by_template(lines: list, image_bgr) -> dict:
         use.sort(key=lambda d: d[1])  # left -> right
         out["valid_until"] = use[0][2]
         out["valid_from"] = use[-1][2]
+
+    # Tier-1 cell refinement (targeted, not blanket — keeps the sync API fast).
+    # A field that bound cleanly to a token is TRUSTED and skipped: re-reading it
+    # would only risk a regression and cost an OCR. We re-read only the fields
+    # that are blank or came from a merge-split guess (not in bound_tok) — crop
+    # the affine-predicted cell at 4x with contrast/sharpen, digit-only. So a
+    # healthy card pays ~zero extra OCR; only the weak cells are re-examined.
+    # Needs an engine and a good affine frame (the cell position comes from it).
+    if engine is not None and M is not None and _CELL_REFINE_ENABLED:
+        heights = sorted(t["y1"] - t["y0"] for t in toks)
+        cell_h = heights[len(heights) // 2] if heights else 20.0
+        for field, (lo, hi) in _CELL_REFINE_RANGES.items():
+            if field in bound_tok:
+                continue  # cleanly bound → trust it, no re-OCR
+            cx, cy = slot_xy(_MULKIYA_TEMPLATE[field])
+            hw = (1.2 if field == "seats" else 2.4) * cell_h
+            hh = 1.0 * cell_h
+            v = _read_cell_number(image_bgr, cx, cy, hw, hh, engine, lo, hi)
+            if v is not None:
+                out[field] = v
     return out
 
 
@@ -1623,17 +1699,19 @@ def _best_template_orientation(crop, engine, use_cls: bool):
 
     Returns (oriented_crop, lines, template_dict)."""
     import cv2
+    # Orientation probes are refine-free (engine omitted) — cheap binding only.
+    # Cell refinement runs once on the chosen orientation.
     lines = _normalize_lines(_run_ocr(engine, crop, use_cls=use_cls))
     d = _extract_by_template(lines, crop)
     if "vin_or_chassis" in d and len(d) >= 6:
-        return crop, lines, d  # confident upright read → done (1 OCR)
+        return crop, lines, _extract_by_template(lines, crop, engine=engine)
 
     flip = cv2.rotate(crop, cv2.ROTATE_180)
     lines2 = _normalize_lines(_run_ocr(engine, flip, use_cls=use_cls))
     d2 = _extract_by_template(lines2, flip)
     if _template_yield_score(d2) > _template_yield_score(d):
-        return flip, lines2, d2
-    return crop, lines, d
+        return flip, lines2, _extract_by_template(lines2, flip, engine=engine)
+    return crop, lines, _extract_by_template(lines, crop, engine=engine)
 
 
 def _coerce_year(value: object) -> int | None:
