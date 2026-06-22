@@ -532,6 +532,38 @@ def _get_mulkiya_classifier() -> BinaryOnnxImageClassifier | None:
     return _mulkiya_classifier
 
 
+def _mulkiya_front_gate(
+    card_label: str,
+    mulkiya_side: dict[str, Any] | None,
+    side_gate_enabled: bool,
+) -> tuple[str, str] | None:
+    """Decide whether a Mulkiya image should be rejected before OCR.
+
+    The pipeline only extracts from the FRONT of a Mulkiya, so:
+      1. card/non-card model → reject anything that is not a card;
+      2. front/back model → reject the back (only the front carries the fields).
+
+    Returns (reason, user_message) to reject, or None to proceed. The front/back
+    model is historically unreliable, so its gate is skipped when disabled.
+    """
+    if card_label == "not card":
+        return (
+            "not_a_card",
+            "This does not look like a card. Please upload a clear photo of the "
+            "FRONT of the Mulkiya (vehicle registration card).",
+        )
+    if (
+        side_gate_enabled
+        and mulkiya_side is not None
+        and mulkiya_side.get("side") == "back"
+    ):
+        return (
+            "mulkiya_back",
+            "This looks like the BACK of the Mulkiya. Please upload the FRONT of the card.",
+        )
+    return None
+
+
 # ── Preprocessing / inference helpers ──────────────────────────────────────
 def _preprocess_for_damage(img_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -1909,6 +1941,43 @@ async def process_document(
                     "mulkiya_side": None,
                 }
                 confidence_score = 0.0
+
+            # ── Hard gates: only a FRONT-of-card Mulkiya proceeds to extraction ──
+            # 1) card/non-card model → reject anything that is not a card.
+            # 2) front/back model → reject the back; only the FRONT carries the
+            #    fields the template extractor reads.
+            # Both gates run BEFORE OCR, so a reject costs no OCR. Image-only
+            # (a PDF has no image-model classification). The front/back model is
+            # historically unreliable (see UPSURE_MULKIYA_FRONT_HIGH), so the side
+            # gate can be disabled with UPSURE_MULKIYA_SIDE_GATE=0.
+            if not is_pdf_file:
+                gate = _mulkiya_front_gate(
+                    label, mulkiya_side, _env_bool("UPSURE_MULKIYA_SIDE_GATE", True)
+                )
+                if gate is not None:
+                    reason, message = gate
+                    classification["accepted"] = False
+                    classification["recapture_required"] = True
+                    classification["recapture_reason"] = reason
+                    classification["recapture_message"] = message
+                    payload = _build_pipeline_response(
+                        source_name=source_name,
+                        input_kind="image",
+                        classification=classification,
+                        confidence_score=confidence_score,
+                        extracted_data=None,
+                        raw_ocr=None,
+                        chunk_source_path=None,
+                        note=message,
+                        car_classification=None,
+                        normalized_input=model_input,
+                    )
+                    record_pipeline_latency(
+                        "process_mulkiya_gate_reject", time.perf_counter() - pipeline_start
+                    )
+                    return json_success(
+                        payload, request=request, start_perf=request.state.start_perf
+                    )
 
             if skip_ocr:
                 payload = _build_pipeline_response(

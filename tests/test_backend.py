@@ -364,6 +364,36 @@ def test_policy_deny_wins_across_views():
     assert decision["deny_reasons"] == [{"view": "back", "class": "deformation", "severity": "moderate"}]
 
 
+# ── Mulkiya front-gate (card/non-card + front/back before OCR) ──────────────
+def test_mulkiya_gate_rejects_non_card():
+    gate = poc_api._mulkiya_front_gate("not card", {"side": "front"}, side_gate_enabled=True)
+    assert gate is not None and gate[0] == "not_a_card"
+
+
+def test_mulkiya_gate_rejects_back():
+    gate = poc_api._mulkiya_front_gate("card", {"side": "back"}, side_gate_enabled=True)
+    assert gate is not None and gate[0] == "mulkiya_back"
+
+
+def test_mulkiya_gate_allows_card_front():
+    assert poc_api._mulkiya_front_gate("card", {"side": "front"}, side_gate_enabled=True) is None
+
+
+def test_mulkiya_gate_side_disabled_allows_back():
+    # With the (unreliable) side model disabled, a back is not rejected on side.
+    assert poc_api._mulkiya_front_gate("card", {"side": "back"}, side_gate_enabled=False) is None
+
+
+def test_mulkiya_gate_non_card_wins_even_when_side_disabled():
+    gate = poc_api._mulkiya_front_gate("not card", {"side": "back"}, side_gate_enabled=False)
+    assert gate is not None and gate[0] == "not_a_card"
+
+
+def test_mulkiya_gate_allows_when_side_unavailable():
+    # No front/back model loaded → only the card gate applies.
+    assert poc_api._mulkiya_front_gate("card", None, side_gate_enabled=True) is None
+
+
 def test_policy_no_damage_grants():
     decision = poc_api._policy_decision({"front": {"damages": []}}, damage_detected=False)
     assert decision["decision"] == "GRANT"
