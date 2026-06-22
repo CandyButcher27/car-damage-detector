@@ -674,6 +674,49 @@ def _detect_document_type(lines: list[str], has_vehicle_specs: bool = False) -> 
     return "other"
 
 
+def _do_extract_vin(text: str) -> str | None:
+    """Extract VIN/chassis number from a text string. Shared by all extractors."""
+    single_artifacts = {
+        "VEHICLE", "MOTOR", "ENGINE", "LICENSE", "LCENSE", "TIRAFIIC",
+        "SULTANATE", "OMAN", "POLICE", "ROYA", "ROYAL", "KINGDOM",
+        "GENERALOFTRAFFIC", "GENERAL", "TRAFFIC",
+    }
+    compound_artifacts = {
+        "VEHICLEMOTOR", "MOTORVEHICLE", "ENGINEMOTOR", "MOTORENGINE",
+        "POLICEOMATIC", "SULTANATEOMAN", "DIRGENERALOFTRAFFIC",
+    }
+    all_artifacts = single_artifacts | compound_artifacts
+    candidates: list[tuple[str, int]] = []
+    for m in re.finditer(r"(?:[A-Za-z0-9]{2,}[\s\-]*)+", text):
+        raw = m.group(0)
+        cand = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+        if 11 <= len(cand) <= 20:
+            is_artifact = any(
+                cand == a or cand.startswith(a) or cand.endswith(a)
+                for a in single_artifacts
+            ) or cand in all_artifacts
+            if not is_artifact:
+                candidates.append((cand, len(cand)))
+    for m in re.finditer(r"[A-Za-z0-9]{11,20}", text):
+        cand = m.group(0).upper()
+        if cand not in all_artifacts and not any(
+            cand.startswith(a) or cand.endswith(a) for a in single_artifacts
+        ):
+            candidates.append((cand, len(cand)))
+    if not candidates:
+        return None
+    uniq = {c: l for c, l in candidates}
+    exact_17 = [
+        c for c, l in uniq.items()
+        if l == 17 and re.search(r"[A-Z]", c) and re.search(r"\d", c)
+    ]
+    if exact_17:
+        return exact_17[0]
+    letter_start = {c: l for c, l in uniq.items() if c and c[0].isalpha()}
+    pool = letter_start if letter_start else uniq
+    return max(pool.items(), key=lambda x: x[1])[0]
+
+
 def _extract_mulkya_rulebased(lines: list[str]) -> dict:
     # Lightweight heuristic extractor for Omani Mulkiya-like layouts.
     joined = "\n".join(lines)
@@ -829,84 +872,17 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
                 plate_number = str(value)
                 break
 
-    def extract_vin(text: str) -> str | None:
-        """Extract VIN/chassis from text, prioritizing alphanumeric sequences of 11-20 chars.
-
-        Robust to splitting across lines, spaces, and dashes. Prefers 17-char VINs.
-        Filters out common OCR artifacts and header/footer terms.
-        """
-        # Single words or common phrase artifacts to reject
-        single_artifacts = {
-            "VEHICLE", "MOTOR", "ENGINE", "LICENSE", "LCENSE", "TIRAFIIC",
-            "SULTANATE", "OMAN", "POLICE", "ROYA", "ROYAL", "KINGDOM",
-            "GENERALOFTRAFFIC", "GENERAL", "TRAFFIC",
-        }
-        # Compound artifacts (concatenations of single artifacts)
-        compound_artifacts = {
-            "VEHICLEMOTOR", "MOTORVEHICLE", "ENGINEMOTOR", "MOTORENGINE",
-            "POLICEOMATIC", "SULTANATEOMAN", "DIRGENERALOFTRAFFIC",
-        }
-        all_artifacts = single_artifacts | compound_artifacts
-
-        candidates: list[tuple[str, int]] = []
-
-        # Pattern 1: chunked (space/dash separated alphanumeric runs totaling 11-20 chars)
-        for m in re.finditer(r"(?:[A-Za-z0-9]{2,}[\s\-]*)+", text):
-            raw = m.group(0)
-            cand = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
-            # Reject if it's a known artifact, starts with a single artifact, or is too short.
-            if 11 <= len(cand) <= 20:
-                # Check if it starts/ends with known single artifacts
-                is_artifact = False
-                for artifact in single_artifacts:
-                    if cand == artifact or cand.startswith(artifact) or cand.endswith(artifact):
-                        is_artifact = True
-                        break
-                if cand in all_artifacts:
-                    is_artifact = True
-                if not is_artifact:
-                    candidates.append((cand, len(cand)))
-
-        # Pattern 2: simple contiguous alphanumeric (11-20 chars).
-        for m in re.finditer(r"[A-Za-z0-9]{11,20}", text):
-            cand = m.group(0).upper()
-            if cand not in all_artifacts and not any(
-                cand.startswith(a) or cand.endswith(a) for a in single_artifacts
-            ):
-                candidates.append((cand, len(cand)))
-
-        if not candidates:
-            return None
-
-        # De-duplicate and rank by length (prefer 17-char, then longest).
-        uniq_dict = {c: l for c, l in candidates}
-        exact_17 = [
-            c
-            for c, l in uniq_dict.items()
-            if l == 17 and re.search(r"[A-Z]", c) and re.search(r"\d", c)
-        ]
-        if exact_17:
-            return exact_17[0]
-        
-        # Prefer candidates starting with letters only after exact VIN-length
-        # candidates have been considered. Some real VINs start with digits.
-        letter_start = {c: l for c, l in uniq_dict.items() if c and c[0].isalpha()}
-        pool = letter_start if letter_start else uniq_dict
-        
-        # Fall back to longest from available pool
-        return max(pool.items(), key=lambda x: x[1])[0]
-
     vin_or_chassis = None
     label_keys = ["الشاص", "الشاصي", "شاصي", "chassis", "vin", "رقم القاعدة", "القاعدة", "الاعدة"]
     for i, ln in enumerate(lines):
         if any(k in ln.lower() for k in label_keys if isinstance(k, str)):
             window = "\n".join(lines[max(0, i - 2) : min(len(lines), i + 8)])
-            cand = extract_vin(window)
+            cand = _do_extract_vin(window)
             if cand:
                 vin_or_chassis = cand
                 break
     if not vin_or_chassis:
-        vin_or_chassis = extract_vin(joined_ascii)
+        vin_or_chassis = _do_extract_vin(joined_ascii)
 
     make = None
     for brand in ["تويوتا", "نيسان", "هيونداي", "كيا", "هوندا", "مرسيدس", "بي ام", "BMW", "LEXUS", "لكزس"]:
@@ -1054,6 +1030,610 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
         "owner_name": None,
         "notes": "Heuristic extraction.",
     }
+
+
+def _split_merged_weight(n: int) -> tuple[int, int] | None:
+    """Split a 7-8 digit number that is two weight values fused by the OCR detector.
+
+    Mulkiya weight rows have two values (empty_weight + max_load) on the same
+    horizontal band. When the OCR detector merges them into one token (e.g.
+    5201060 or 20002000), we need to find the correct split point.
+
+    Strategy: collect all valid splits, then prefer the one whose parts have
+    equal digit length (symmetric split = more likely the two values have similar
+    magnitudes, as on a real card). Fall back to the first valid split.
+    """
+    s = str(n)
+    valid: list[tuple[int, int, int]] = []  # (left, right, |len_diff|)
+    for i in range(3, len(s) - 2):
+        left, right = int(s[:i]), int(s[i:])
+        if 100 <= left <= 5000 and 100 <= right <= 50000:
+            valid.append((left, right, abs(len(s[:i]) - len(s[i:]))))
+    if not valid:
+        return None
+    valid.sort(key=lambda x: x[2])  # prefer most symmetric split
+    return valid[0][0], valid[0][1]
+
+
+def _assign_dates_sorted(dates: list[str]) -> tuple[str | None, str | None]:
+    """Return (issue_date, expiry_date) sorted chronologically from a list of date strings."""
+    def date_key(v: str) -> tuple:
+        m = re.fullmatch(r"(\d{2,4})/(\d{1,2})/(\d{1,2})", v)
+        if not m:
+            return (9999, 0, 0)
+        y, mo, d = (int(x) for x in m.groups())
+        if y < 100:
+            y += 2000
+        return (y, mo, d)
+
+    dated = [(date_key(d), d) for d in dates]
+    dated = [(k, v) for k, v in dated if k[0] < 9999]
+    dated.sort()
+    if len(dated) >= 2:
+        return dated[0][1], dated[-1][1]
+    if len(dated) == 1:
+        return None, dated[0][1]
+    return None, None
+
+
+def _weight_row_crop(image_bgr, token: dict, engine) -> tuple[int | None, int | None]:
+    """Crop a horizontal band around a token and re-OCR to separate two weight values."""
+    import cv2
+    H, W = image_bgr.shape[:2]
+    h = max(float(token['y1']) - float(token['y0']), 20.0)
+    pad = h * 0.7
+    y0 = max(0, int(token['y0'] - pad))
+    y1 = min(H, int(token['y1'] + pad))
+    row_crop = image_bgr[y0:y1, 0:W]
+    row_crop = cv2.resize(row_crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    result = engine(row_crop)
+    if result is None or not result.txts:
+        return None, None
+    boxes = getattr(result, 'boxes', None)
+    nums_with_x: list[tuple[int, float]] = []
+    for i, (txt, conf) in enumerate(zip(result.txts, result.scores)):
+        if float(conf) < 0.35:
+            continue
+        txt = _convert_arabic_indic_digits_to_ascii(str(txt))
+        box = boxes[i].tolist() if boxes is not None and i < len(boxes) else None
+        xc = float(sum(p[0] for p in box) / len(box)) if box else 0.0
+        for m in re.finditer(r'\b(\d{2,5})\b', txt):
+            n = int(m.group())
+            if 100 <= n <= 50000:
+                nums_with_x.append((n, xc))
+    if len(nums_with_x) >= 2:
+        nums_with_x.sort(key=lambda x: x[1])
+        a, b_ = nums_with_x[0][0], nums_with_x[-1][0]
+        return (min(a, b_), max(a, b_))
+    return None, None
+
+
+_RANGE_EXTRACTOR_ENABLED = os.getenv("UPSURE_RANGE_EXTRACTOR", "1") not in ("0", "false", "False")
+
+
+def _extract_by_range_with_boxes(lines: list, image_bgr, engine=None) -> dict:
+    """All-token numeric extractor: no keyword binding, uses value ranges + y-position.
+
+    Designed for EN OCR output where Arabic labels are absent.  Handles the
+    common detector cell-merge failure (e.g. 5201060 → 520 kg + 1060 kg) via
+    a heuristic split and a row-crop re-OCR fallback.
+
+    Returns a partial dict covering only numeric / structured fields.  Text
+    fields (make, model, color, vehicle_type) come from the Arabic aux pass.
+    """
+    import numpy as np
+
+    if not lines:
+        return {}
+
+    tokens: list[dict] = []
+    for item in lines:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2):
+            continue
+        box, rest = item
+        if not (isinstance(rest, (list, tuple)) and len(rest) == 2):
+            continue
+        text, conf = rest
+        if float(conf) < 0.25:
+            continue
+        try:
+            b = np.asarray(box, dtype=float)
+            yc = float(b[:, 1].mean())
+            xc = float(b[:, 0].mean())
+            y0_t = float(b[:, 1].min()); y1_t = float(b[:, 1].max())
+            x0_t = float(b[:, 0].min()); x1_t = float(b[:, 0].max())
+        except Exception:
+            continue
+        tokens.append({
+            'text': _convert_arabic_indic_digits_to_ascii(str(text)),
+            'raw': str(text),
+            'yc': yc, 'xc': xc,
+            'y0': y0_t, 'y1': y1_t, 'x0': x0_t, 'x1': x1_t,
+        })
+
+    if not tokens:
+        return {}
+
+    H = float(image_bgr.shape[0]) if image_bgr is not None else max(t['y1'] for t in tokens) + 1
+    all_text = " ".join(t['text'] for t in tokens)
+    date_re = re.compile(r'\b\d{2,4}/\d{1,2}/\d{1,2}\b')
+
+    dates = date_re.findall(all_text)
+    issue_date, expiry_date = _assign_dates_sorted(dates)
+
+    all_raw = " ".join(t['raw'] for t in tokens)
+    vin = _do_extract_vin(all_raw)
+
+    # Build numeric token list; split merged weight tokens directly.
+    # Merged-split results bypass the candidate pool — we know they are weights.
+    num_tokens: list[dict] = []
+    direct_weights: list[int] = []   # values from a successful merge split
+    merged_weight_token: dict | None = None  # source token (for row-crop fallback)
+
+    for t in tokens:
+        nd = date_re.sub(' ', t['text'])
+        for m in re.finditer(r'\b(\d{1,8})\b', nd):
+            n = int(m.group())
+            if 1_000_000 <= n <= 99_999_999:
+                split = _split_merged_weight(n)
+                if split:
+                    direct_weights.extend(split)
+                    if merged_weight_token is None:
+                        merged_weight_token = t
+                    continue  # do not add to num_tokens
+            num_tokens.append({**t, 'val': n})
+
+    # Years — 4-digit, 1990-2030
+    # Mulkiya layout (y=0 at top): model_year row is ABOVE manufacture_year row.
+    # Sort descending by y-center so largest yc (lowest on card) = manufacture year first.
+    seen_years: set[int] = set()
+    year_tokens = []
+    for nt in sorted((x for x in num_tokens if 1990 <= x['val'] <= 2030 and len(str(x['val'])) == 4), key=lambda x: -x['yc']):
+        if nt['val'] not in seen_years:
+            year_tokens.append(nt)
+            seen_years.add(nt['val'])
+
+    # ALL year-range integers are reserved — prevents e.g. 2018 leaking into weight pool
+    all_year_range: set[int] = {nt['val'] for nt in num_tokens if 1990 <= nt['val'] <= 2030}
+    used: set[int] = set(all_year_range)
+    year = year_tokens[0]['val'] if year_tokens else None
+    model_year = year_tokens[1]['val'] if len(year_tokens) > 1 else None
+
+    # Engine CC — 3-4 digit, 800-8999, not a year, in upper 65% of card
+    cc_cut = H * 0.65
+    cc_cands = [
+        nt for nt in num_tokens
+        if 800 <= nt['val'] <= 8999
+        and nt['val'] not in used
+        and not (1990 <= nt['val'] <= 2030)
+        and nt['yc'] < cc_cut
+    ]
+    cc_cands.sort(key=lambda x: x['yc'])
+    engine_cc = cc_cands[0]['val'] if cc_cands else None
+    if engine_cc is not None:
+        used.add(engine_cc)
+
+    # Seats — 1-9, in lower 50% of card
+    seat_cut = H * 0.5
+    seat_cands = [
+        nt for nt in num_tokens
+        if 1 <= nt['val'] <= 9 and nt['val'] not in used and nt['yc'] > seat_cut
+    ]
+    seat_cands.sort(key=lambda x: -x['yc'])
+    seats = seat_cands[0]['val'] if seat_cands else None
+    if seats is not None:
+        used.add(seats)
+
+    # Weights — 100-5000, in lower 60% of card
+    wt_cut = H * 0.4
+    wt_cands = [
+        nt for nt in num_tokens
+        if 100 <= nt['val'] <= 5000 and nt['val'] not in used and nt['yc'] > wt_cut
+    ]
+    wt_cands.sort(key=lambda x: (x['yc'], x['xc']))
+
+    empty_weight_kg: int | None = None
+    max_load_kg: int | None = None
+
+    if direct_weights:
+        # Merge-split result: most reliable path — detector saw both values fused.
+        direct_weights.sort()
+        empty_weight_kg = direct_weights[0]
+        max_load_kg = direct_weights[-1] if len(direct_weights) > 1 else None
+    elif len(wt_cands) >= 2:
+        vals = sorted(wt['val'] for wt in wt_cands[:2])
+        empty_weight_kg, max_load_kg = vals[0], vals[1]
+    elif len(wt_cands) == 1:
+        empty_weight_kg = wt_cands[0]['val']
+        if image_bgr is not None and engine is not None:
+            src = merged_weight_token or wt_cands[0]
+            w1, w2 = _weight_row_crop(image_bgr, src, engine)
+            if w1 is not None and w2 is not None:
+                empty_weight_kg, max_load_kg = min(w1, w2), max(w1, w2)
+    elif image_bgr is not None and engine is not None and merged_weight_token is not None:
+        w1, w2 = _weight_row_crop(image_bgr, merged_weight_token, engine)
+        if w1 is not None and w2 is not None:
+            empty_weight_kg, max_load_kg = min(w1, w2), max(w1, w2)
+
+    # Plate number — 3-7 digit, in top 40% of card, not a year
+    pl_cut = H * 0.4
+    pl_cands = [
+        nt for nt in num_tokens
+        if 100 <= nt['val'] <= 9_999_999
+        and not (1990 <= nt['val'] <= 2030)
+        and nt['yc'] < pl_cut
+    ]
+    pl_cands.sort(key=lambda x: -len(str(x['val'])))
+    plate_number = str(pl_cands[0]['val']) if pl_cands else None
+
+    return {
+        'plate_number': plate_number,
+        'vin_or_chassis': vin,
+        'year': year,
+        'model_year': model_year,
+        'engine_cc': engine_cc,
+        'empty_weight_kg': empty_weight_kg,
+        'max_load_kg': max_load_kg,
+        'seats': seats,
+        'issue_date': issue_date,
+        'expiry_date': expiry_date,
+    }
+
+
+# ── Positional-template extractor ───────────────────────────────────────────
+# Built empirically from 5 fully hand-labelled Omani Mulkiya fronts (labelImg /
+# YOLO boxes), normalised to the field-cluster bbox and averaged. Field std-devs
+# are tiny (cx≤0.086, cy≤0.019) → the front layout is fixed. Once the card is
+# deskewed/oriented, each value sits at a known card-relative position, so we
+# bind a value to a field by GEOMETRY, not by reading its Arabic label. See
+# eval/yolo/build_template.py + template.json.
+_MULKIYA_TEMPLATE = {
+    "plate_number":       {"cx": 0.8568, "cy": 0.0474},
+    "model_year":         {"cx": 0.2652, "cy": 0.3891},
+    "engine_cc":          {"cx": 0.8975, "cy": 0.4752},
+    "empty_weight_kg":    {"cx": 0.5421, "cy": 0.4888},
+    "max_load_kg":        {"cx": 0.0512, "cy": 0.5027},
+    "manufacturing_year": {"cx": 0.9165, "cy": 0.5852},
+    "seats":              {"cx": 0.5828, "cy": 0.5986},
+    "no_of_axles":        {"cx": 0.0726, "cy": 0.6192},
+    "vin_or_chassis":     {"cx": 0.5978, "cy": 0.7052},
+    "engine_number":      {"cx": 0.8702, "cy": 0.8074},
+    "valid_from":         {"cx": 0.7506, "cy": 0.9218},
+    "valid_until":        {"cx": 0.1999, "cy": 0.9428},
+}
+
+_TEMPLATE_EXTRACTOR_ENABLED = os.getenv("UPSURE_TEMPLATE_EXTRACTOR", "1") not in ("0", "false", "False")
+# Max normalised distance (fraction of cluster diagonal) for a token to bind to
+# a field slot. Loose enough to absorb residual skew, tight enough to reject the
+# wrong column.
+_TEMPLATE_MATCH_GATE = 0.28
+
+
+def _loose_date(text: str) -> str | None:
+    """Parse a date, tolerant of one OCR-dropped separator.
+
+    Strict `YYYY/MM/DD` (any of / or -) first. Else, if the token still carries
+    at least one separator (so we don't grab a bare plate/VIN number), recover an
+    8-digit YYYYMMDD whose parts fall in valid date ranges — handles OCR reads
+    like '202503-10' (the leading '-' was lost) → '2025/03/10'.
+    """
+    t = _convert_arabic_indic_digits_to_ascii(text)
+    m = re.search(r"\b(\d{2,4})[/\-](\d{1,2})[/\-](\d{1,2})\b", t)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    if "-" in t or "/" in t:
+        digits = re.sub(r"\D", "", t)
+        if len(digits) == 8:
+            y, mo, d = digits[:4], digits[4:6], digits[6:8]
+            if 1990 <= int(y) <= 2035 and 1 <= int(mo) <= 12 and 1 <= int(d) <= 31:
+                return f"{y}/{mo}/{d}"
+    return None
+
+
+def _template_field_value(field: str, text: str):
+    """Validate/parse a token's text for a given template field. Returns the
+    typed value (int / str) or None if the token can't be that field."""
+    t = _convert_arabic_indic_digits_to_ascii(text)
+    loose = _loose_date(t)
+
+    if field in ("valid_from", "valid_until"):
+        return loose
+
+    date_m = loose
+
+    if field == "vin_or_chassis":
+        return _do_extract_vin(t)
+
+    if field == "engine_number":
+        if re.search(r"\bNIL\b", t, re.IGNORECASE):
+            return "NIL"
+        m = re.search(r"\b[A-Za-z0-9]{5,20}\b", t)
+        return m.group(0).upper() if m and re.search(r"\d", m.group(0)) else None
+
+    # numeric fields — never read a digit out of a date token
+    if date_m:
+        return None
+    # ...nor out of an alphanumeric token (VIN/plate-with-letter/engine-number):
+    # plate, cc, weights, seats, axles, years are pure-digit cells, so a token
+    # carrying Latin letters is the wrong field (prevents '4' leaking from a VIN).
+    if re.search(r"[A-Za-z]", t):
+        return None
+    nums = [int(n) for n in re.findall(r"\d{1,8}", t)]
+    if not nums:
+        return None
+
+    if field in ("model_year", "manufacturing_year"):
+        for n in nums:
+            if 1980 <= n <= 2030 and len(str(n)) == 4:
+                return n
+        return None
+    if field == "plate_number":
+        for n in nums:
+            if 3 <= len(str(n)) <= 7 and not (1980 <= n <= 2030):
+                return str(n)
+        return None
+    if field == "engine_cc":
+        for n in nums:
+            if 600 <= n <= 8999 and not (1980 <= n <= 2030):
+                return n
+        return None
+    if field == "empty_weight_kg":
+        # Kerb weight of an insured car/van — reject plate-sized garbage (37319).
+        for n in nums:
+            if 100 <= n <= 6000 and not (1980 <= n <= 2030):
+                return n
+        return None
+    if field == "max_load_kg":
+        for n in nums:
+            if 100 <= n <= 50000 and not (1980 <= n <= 2030):
+                return n
+        return None
+    if field == "seats":
+        for n in nums:
+            if 1 <= n <= 9:
+                return n
+        return None
+    if field == "no_of_axles":
+        for n in nums:
+            if 1 <= n <= 6:
+                return n
+        return None
+    return None
+
+
+def _find_template_anchors(toks: list[dict]) -> dict:
+    """Locate the format-UNIQUE fields we can trust regardless of position:
+    VIN (17-ish alnum), the two validity dates (bottom row, split by x), and the
+    plate (top-most short numeric). These pin the card's coordinate frame so the
+    format-AMBIGUOUS fields (cc, weights, seats, years — all bare integers) can be
+    placed by transform instead of guessed. Returns {field: (px, py)}."""
+    anchors: dict[str, tuple[float, float]] = {}
+
+    # VIN — unmistakable 14-18 char alnum with letters+digits.
+    best_vin = None
+    for t in toks:
+        v = _do_extract_vin(_convert_arabic_indic_digits_to_ascii(t["raw"]))
+        if v and 14 <= len(v) <= 18 and re.search(r"[A-Z]", v) and re.search(r"\d", v):
+            if best_vin is None or len(v) > best_vin[1]:
+                best_vin = (t, len(v))
+    if best_vin:
+        anchors["vin_or_chassis"] = (best_vin[0]["cx"], best_vin[0]["cy"])
+
+    # Dates — take the two lowest date tokens; left = valid_until, right = valid_from.
+    date_ts = [t for t in toks if _loose_date(t["raw"])]
+    if len(date_ts) >= 2:
+        bottom = sorted(date_ts, key=lambda t: -t["cy"])[:2]
+        bottom.sort(key=lambda t: t["cx"])
+        anchors["valid_until"] = (bottom[0]["cx"], bottom[0]["cy"])
+        anchors["valid_from"] = (bottom[1]["cx"], bottom[1]["cy"])
+
+    # Plate — top-most 3-7 digit non-year numeric token.
+    plate_ts = []
+    for t in toks:
+        a = _convert_arabic_indic_digits_to_ascii(t["raw"])
+        if _loose_date(a):
+            continue
+        for n in re.findall(r"\d+", a):
+            if 3 <= len(n) <= 7 and not (1980 <= int(n) <= 2030):
+                plate_ts.append(t)
+                break
+    if plate_ts:
+        top = min(plate_ts, key=lambda t: t["cy"])
+        anchors["plate_number"] = (top["cx"], top["cy"])
+
+    return anchors
+
+
+def _fit_template_affine(anchors: dict):
+    """Fit template-space (cx,cy in [0,1]) → image-pixel affine from the anchor
+    correspondences. >=3 anchors → full affine (RANSAC); 2 → similarity
+    (rotation+scale+translation). Returns a 2x3 matrix M or None."""
+    import cv2
+    import numpy as np
+
+    src, dst = [], []
+    for field, (px, py) in anchors.items():
+        slot = _MULKIYA_TEMPLATE.get(field)
+        if slot:
+            src.append([slot["cx"], slot["cy"]])
+            dst.append([px, py])
+    if len(src) < 2:
+        return None
+    src = np.asarray(src, dtype=np.float32)
+    dst = np.asarray(dst, dtype=np.float32)
+    if len(src) >= 3:
+        M, _inl = cv2.estimateAffine2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=12.0)
+    else:
+        M, _inl = cv2.estimateAffinePartial2D(src, dst)
+    return M
+
+
+def _extract_by_template(lines: list, image_bgr) -> dict:
+    """Bind values to fields by card-relative position (fixed Mulkiya layout).
+
+    Framing: first try to fit an affine transform from the format-unique anchor
+    fields (plate / VIN / the two dates) onto the template — this rides on the
+    fields we trust and self-corrects scale/rotation/skew. If too few anchors are
+    found, fall back to normalising against the value-token cluster bbox. Then
+    greedy-match each field slot to the nearest type-compatible token.
+    Returns only fields that matched a token.
+
+    Requires a deskewed/oriented card — geometry is meaningless on a rotated
+    frame, so the caller must crop/orient first.
+    """
+    import numpy as np
+
+    if not lines:
+        return {}
+
+    toks: list[dict] = []
+    for item in lines:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2):
+            continue
+        box, rest = item
+        if not (isinstance(rest, (list, tuple)) and len(rest) == 2):
+            continue
+        text, conf = rest
+        if float(conf) < 0.25:
+            continue
+        ascii_t = _convert_arabic_indic_digits_to_ascii(str(text))
+        # value-like: has a digit, or is the literal NIL engine-number
+        if not (re.search(r"\d", ascii_t) or re.search(r"\bNIL\b", ascii_t, re.IGNORECASE)):
+            continue
+        try:
+            b = np.asarray(box, dtype=float)
+            xs, ys = b[:, 0], b[:, 1]
+            toks.append({
+                "raw": str(text),
+                "cx": float(xs.mean()), "cy": float(ys.mean()),
+                "x0": float(xs.min()), "x1": float(xs.max()),
+                "y0": float(ys.min()), "y1": float(ys.max()),
+            })
+        except Exception:
+            continue
+
+    if len(toks) < 3:
+        return {}
+
+    cx0 = min(t["x0"] for t in toks)
+    cy0 = min(t["y0"] for t in toks)
+    cx1 = max(t["x1"] for t in toks)
+    cy1 = max(t["y1"] for t in toks)
+    cw = max(cx1 - cx0, 1.0)
+    ch = max(cy1 - cy0, 1.0)
+    diag = (cw ** 2 + ch ** 2) ** 0.5
+
+    # Preferred frame: affine fit on the trusted anchors. Fall back to bbox.
+    anchors = _find_template_anchors(toks)
+    M = _fit_template_affine(anchors)
+
+    def slot_xy(slot: dict) -> tuple[float, float]:
+        if M is not None:
+            import numpy as _np
+            p = M @ _np.asarray([slot["cx"], slot["cy"], 1.0])
+            return float(p[0]), float(p[1])
+        return cx0 + slot["cx"] * cw, cy0 + slot["cy"] * ch
+
+    # All compatible (distance, field, token, value) triples.
+    pairs: list[tuple[float, str, int, object]] = []
+    for field, slot in _MULKIYA_TEMPLATE.items():
+        tx, ty = slot_xy(slot)
+        for i, t in enumerate(toks):
+            val = _template_field_value(field, t["raw"])
+            if val is None:
+                continue
+            dist = (((t["cx"] - tx)) ** 2 + ((t["cy"] - ty)) ** 2) ** 0.5 / diag
+            if dist <= _TEMPLATE_MATCH_GATE:
+                pairs.append((dist, field, i, val))
+
+    pairs.sort(key=lambda p: p[0])
+    out: dict[str, object] = {}
+    used_tokens: set[int] = set()
+    for dist, field, i, val in pairs:
+        if field in out or i in used_tokens:
+            continue
+        out[field] = val
+        used_tokens.add(i)
+
+    # Merged-weight rescue. The two weight cells are adjacent, so the detector
+    # often fuses them into one token (e.g. 5201060, 385260). A fused token fails
+    # the per-field range check, so neither weight binds. Find a 5-8 digit token
+    # in the weight band (~0.5 of cluster height) and split it. Observed on these
+    # light vehicles: empty_weight > max_load, so larger half = empty.
+    if not ("empty_weight_kg" in out and "max_load_kg" in out):
+        ewx, ewy = slot_xy(_MULKIYA_TEMPLATE["empty_weight_kg"])
+        mlx, mly = slot_xy(_MULKIYA_TEMPLATE["max_load_kg"])
+        for i, t in enumerate(toks):
+            if i in used_tokens:
+                continue
+            # near either weight cell (within ~25% of the frame diagonal)
+            de = (((t["cx"] - ewx)) ** 2 + ((t["cy"] - ewy)) ** 2) ** 0.5 / diag
+            dm = (((t["cx"] - mlx)) ** 2 + ((t["cy"] - mly)) ** 2) ** 0.5 / diag
+            if min(de, dm) > 0.30:
+                continue
+            a = _convert_arabic_indic_digits_to_ascii(t["raw"])
+            m = re.search(r"\b(\d{5,8})\b", a)
+            if not m:
+                continue
+            split = _split_merged_weight(int(m.group(1)))
+            if split:
+                out["empty_weight_kg"], out["max_load_kg"] = max(split), min(split)
+                used_tokens.add(i)
+                break
+
+    # Validity dates by x-position. Both dates sit on the bottom row; the card
+    # prints "from" on the right, "to/until" on the left. Binding by x is more
+    # robust than nearest-distance when a skewed crop drops stray dates higher up.
+    date_toks: list[tuple[float, float, str]] = []
+    for t in toks:
+        d = _loose_date(t["raw"])
+        if d:
+            fy = (t["cy"] - cy0) / ch
+            date_toks.append((fy, t["cx"], d))
+    bottom = [d for d in date_toks if d[0] >= 0.78]
+    use = bottom if len(bottom) >= 2 else date_toks
+    if len(use) >= 2:
+        use.sort(key=lambda d: d[1])  # left -> right
+        out["valid_until"] = use[0][2]
+        out["valid_from"] = use[-1][2]
+    return out
+
+
+def _template_yield_score(d: dict) -> float:
+    """Score a template extraction for orientation selection. Rewards bound
+    fields, with extra weight on the unmistakable ones (VIN pattern, dates) that
+    only parse when the card is upright — so an upside-down garbage read scores
+    near zero even if a few stray numbers happen to bind."""
+    score = float(len(d))
+    if "vin_or_chassis" in d:
+        score += 3.0
+    if "valid_from" in d or "valid_until" in d:
+        score += 1.0
+    if "plate_number" in d:
+        score += 1.0
+    return score
+
+
+def _best_template_orientation(crop, engine, use_cls: bool):
+    """The crop arrives already oriented by card_crop's cheap pixel header check
+    (no OCR). OCR it once and extract. Only if that read is weak (no VIN and few
+    fields — i.e. the header check may have mis-flipped) do we pay a single extra
+    OCR on the 180° flip and keep whichever binds more. Max 2 OCR per card vs the
+    old 4, and card_crop no longer OCRs for orientation either.
+
+    Returns (oriented_crop, lines, template_dict)."""
+    import cv2
+    lines = _normalize_lines(_run_ocr(engine, crop, use_cls=use_cls))
+    d = _extract_by_template(lines, crop)
+    if "vin_or_chassis" in d and len(d) >= 6:
+        return crop, lines, d  # confident upright read → done (1 OCR)
+
+    flip = cv2.rotate(crop, cv2.ROTATE_180)
+    lines2 = _normalize_lines(_run_ocr(engine, flip, use_cls=use_cls))
+    d2 = _extract_by_template(lines2, flip)
+    if _template_yield_score(d2) > _template_yield_score(d):
+        return flip, lines2, d2
+    return crop, lines, d
 
 
 def _coerce_year(value: object) -> int | None:
@@ -1998,35 +2578,107 @@ def main() -> None:
                 if isinstance(data["validation_notes"], list):
                     data["validation_notes"].append(f"auxiliary_arabic_ocr_failed: {exc}")
 
-        # Spatial numeric override: the flat extractor mis-binds cc / weights /
-        # seats / year. Re-read those from the card geometry, but only when the
-        # flat numerics look missing/implausible — a healthy flat read skips the
-        # extra Arabic OCR pass (see `_numeric_needs_spatial`). Reuse the
-        # already-loaded engines/boxes to avoid extra model loads.
-        spatial_overrides: dict[str, int] = {}
-        if _SPATIAL_NUMERIC_ENABLED and _numeric_needs_spatial(data):
+        # Positional-template extractor (AUTHORITATIVE for numerics/dates).
+        # Deskew/orient the card first, then bind each value to its field by
+        # card-relative position (fixed Mulkiya-front layout). This is what the
+        # user asked for: straighten, then read by geometry — robust to rotation,
+        # which broke the range extractor's absolute y-position logic.
+        # Template field names → existing JSON schema names.
+        _TEMPLATE_TO_SCHEMA = {
+            "plate_number": "plate_number",
+            "model_year": "model_year",
+            "manufacturing_year": "year",
+            "engine_cc": "engine_cc",
+            "empty_weight_kg": "empty_weight_kg",
+            "max_load_kg": "max_load_kg",
+            "seats": "seats",
+            "no_of_axles": "no_of_axles",
+            "vin_or_chassis": "vin_or_chassis",
+            "engine_number": "engine_number",
+            "valid_from": "issue_date",
+            "valid_until": "expiry_date",
+        }
+        # Position-AMBIGUOUS fields: bare integers with overlapping ranges that
+        # can ONLY be told apart by card position. When the anchor frame is
+        # confident we trust it exclusively for these — a blank beats a wrong
+        # guess from the flat/range extractors (which is what the user asked for:
+        # position, not number-guessing).
+        _AMBIGUOUS_FIELDS = ("engine_cc", "empty_weight_kg", "max_load_kg", "seats", "year", "model_year")
+        template_set: set[str] = set()
+        template_confident = False
+        if _TEMPLATE_EXTRACTOR_ENABLED and not is_arabic:
             try:
-                # Reuse the primary ch+en engine for digit reads; when the
-                # primary pass was already Arabic, reuse its boxes too.
-                reuse_boxes = _boxes_from_lines(raw_lines) if is_arabic else None
-                spatial = _extract_spatial_numeric(
-                    str(image_path), image_bgr,
-                    arabic_boxes=reuse_boxes,
-                    digit_engine=(engine if not is_arabic else None),
+                import card_crop
+                crop, crop_reason = card_crop.choose_mulkiya_crop(image_bgr)
+                # Resolve residual 180°/90° ambiguity by extraction yield.
+                _crop_oriented, crop_lines, tmpl = _best_template_orientation(
+                    crop, engine, args.use_angle_cls
                 )
-                for field, val in spatial.items():
-                    if data.get(field) != val:
-                        spatial_overrides[field] = val
-                    data[field] = val
+                # Confident = the trusted anchors (plate+VIN) were found and the
+                # affine frame bound a healthy number of fields.
+                template_confident = (
+                    "vin_or_chassis" in tmpl and "plate_number" in tmpl and len(tmpl) >= 6
+                )
+                tmpl_overrides: dict = {}
+                for tfield, val in tmpl.items():
+                    sfield = _TEMPLATE_TO_SCHEMA.get(tfield, tfield)
+                    if val != data.get(sfield):
+                        tmpl_overrides[sfield] = val
+                    data[sfield] = val
+                    template_set.add(sfield)
+                # Confident frame → drop the flat extractor's guesses for any
+                # ambiguous field the template left blank (prefer blank to wrong).
+                if template_confident:
+                    for f in _AMBIGUOUS_FIELDS:
+                        if f not in template_set:
+                            data[f] = None
+                if tmpl_overrides:
+                    data.setdefault("validation_notes", [])
+                    if isinstance(data["validation_notes"], list):
+                        changed = ", ".join(f"{k}={v}" for k, v in tmpl_overrides.items())
+                        data["validation_notes"].append(f"template_override[{crop_reason}]: {changed}")
             except Exception as exc:
                 data.setdefault("validation_notes", [])
                 if isinstance(data["validation_notes"], list):
-                    data["validation_notes"].append(f"spatial_numeric_failed: {exc}")
-        if spatial_overrides:
-            data.setdefault("validation_notes", [])
-            if isinstance(data["validation_notes"], list):
-                changed = ", ".join(f"{k}={v}" for k, v in spatial_overrides.items())
-                data["validation_notes"].append(f"spatial_numeric_override: {changed}")
+                    data["validation_notes"].append(f"template_extractor_failed: {exc}")
+
+        # Range-based numeric extractor: fallback that fills only fields the
+        # template did NOT bind. Uses value ranges + y-position; handles the
+        # detector cell-merge for weights (5201060 → 520 + 1060). Precedence:
+        # template > range > flat keyword extractor. When the anchor frame is
+        # confident, range is NOT allowed to guess the ambiguous numerics.
+        if _RANGE_EXTRACTOR_ENABLED:
+            try:
+                range_data = _extract_by_range_with_boxes(lines, image_bgr, engine)
+                range_overrides: dict = {}
+                _range_fields = (
+                    'plate_number', 'vin_or_chassis', 'year', 'model_year',
+                    'engine_cc', 'empty_weight_kg', 'max_load_kg', 'seats',
+                    'issue_date', 'expiry_date',
+                )
+                for field in _range_fields:
+                    if field in template_set:
+                        continue  # template owns this field
+                    if template_confident and field in _AMBIGUOUS_FIELDS:
+                        continue  # no guessing the ambiguous fields under a good frame
+                    if range_data.get(field) is not None:
+                        if range_data[field] != data.get(field):
+                            range_overrides[field] = range_data[field]
+                        data[field] = range_data[field]
+                # If range extractor found no seats, invalidate flat extractor's
+                # out-of-range value (flat extractor has no geometry and often
+                # picks arbitrary numbers in 1-80).
+                if range_data.get('seats') is None and isinstance(data.get('seats'), int) and not (1 <= data['seats'] <= 9):
+                    data['seats'] = None
+                if range_overrides:
+                    data.setdefault("validation_notes", [])
+                    if isinstance(data["validation_notes"], list):
+                        changed = ", ".join(f"{k}={v}" for k, v in range_overrides.items())
+                        data["validation_notes"].append(f"range_extractor_override: {changed}")
+            except Exception as exc:
+                data.setdefault("validation_notes", [])
+                if isinstance(data["validation_notes"], list):
+                    data["validation_notes"].append(f"range_extractor_failed: {exc}")
 
         # Validate extracted data and add any inconsistency notes.
         _validate_and_note_data(data)
@@ -2041,7 +2693,8 @@ def main() -> None:
                     "auxiliary_ocr_lang": aux_ocr_lang,
                     "fix_arabic_reverse": fix_arabic_reverse,
                     "reshape_arabic": reshape_arabic,
-                    "spatial_numeric": _SPATIAL_NUMERIC_ENABLED,
+                    "template_extractor": _TEMPLATE_EXTRACTOR_ENABLED,
+                    "range_extractor": _RANGE_EXTRACTOR_ENABLED,
                 }
             )
         out_json = image_path.with_name(f"{image_path.stem}_mulkya.json")
