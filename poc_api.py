@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -41,10 +42,10 @@ from xml.etree import ElementTree
 
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps
 from starlette.concurrency import run_in_threadpool
 
@@ -78,6 +79,7 @@ from app.observability import (
 )
 from app.resilience import Bulkhead, CircuitBreaker, retry, run_with_timeout, safe_call
 from app.responses import envelope_success, json_error, json_success
+from damage_report import generate_damage_report
 from app.settings import SETTINGS, repo_root
 
 from card_inference import CardNonCardModel, _resolve_model_path
@@ -121,6 +123,8 @@ if load_keras_model is not None:
 # ── Paths / constants ──────────────────────────────────────────────────────
 POC_DIR = repo_root()
 OCR_SCRIPT = POC_DIR / "ocr_simple_test.py"
+REPORTS_DIR = POC_DIR / "reports"
+REPORTS_DIR.mkdir(exist_ok=True)
 
 try:
     MODEL_PATH = _resolve_model_path(POC_DIR, None)
@@ -188,12 +192,10 @@ def _env_float_top(name: str, default: float) -> float:
         return default
 
 
-# Binary damage head sigmoid threshold. Bumped from 0.25 -> 0.5 in 1.1.1
-# after observing systematic false positives on clean cars in production
-# (per-view damage_detected=true with prob_damaged > 0.99 on visibly
-# undamaged photos). Tunable per-deployment via env so we can re-tune
-# without a redeploy while collecting calibration data.
-DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.50)
+# Binary damage head threshold. Root cause of 1.1.1 false positives was inverted
+# class indices (model: 0=damaged, 1=clean; code assumed opposite). Reverted to
+# 0.25 now that _damage_result_from_probs uses the correct index.
+DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.25)
 DAMAGE_IMG_SIZE = 260
 DAMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DAMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -547,13 +549,19 @@ def _softmax_rows(logits: np.ndarray) -> np.ndarray:
 
 
 def _damage_result_from_probs(probs: np.ndarray) -> dict[str, Any]:
-    """Convert a single (2,) probability vector into the response dict."""
-    label = 1 if probs[1] >= DAMAGE_THRESHOLD else 0
+    """Convert a single (2,) probability vector into the response dict.
+
+    Model class order: index 0 = damaged, index 1 = clean.
+    """
+    prob_damaged = float(probs[0])
+    prob_clean   = float(probs[1])
+    damage_detected = prob_damaged >= DAMAGE_THRESHOLD
+    confidence = prob_damaged if damage_detected else prob_clean
     return {
-        "damage_detected":  bool(label == 1),
-        "confidence_score": float(round(float(probs[label]), 4)),
-        "prob_damaged":     float(round(float(probs[1]), 4)),
-        "prob_clean":       float(round(float(probs[0]), 4)),
+        "damage_detected":  damage_detected,
+        "confidence_score": float(round(confidence, 4)),
+        "prob_damaged":     float(round(prob_damaged, 4)),
+        "prob_clean":       float(round(prob_clean, 4)),
     }
 
 
@@ -2182,6 +2190,7 @@ async def predict_damage(
     back:  UploadFile | None = File(default=None),
     left:  UploadFile | None = File(default=None),
     right: UploadFile | None = File(default=None),
+    report: bool = Query(default=False, description="Set true to receive a PDF damage report instead of JSON"),
 ):
     views: dict[str, UploadFile] = {
         k: v for k, v in [("front", front), ("back", back), ("left", left), ("right", right)] if v
@@ -2287,7 +2296,30 @@ async def predict_damage(
         "skipped_views":        skipped_views,
         "policy_decision":      _policy_decision(per_view, overall_damaged),
     }
+
+    if report:
+        pdf_bytes = await run_in_threadpool(
+            generate_damage_report, view_img_bytes, per_view, payload
+        )
+        report_id = uuid.uuid4().hex[:12]
+        report_filename = f"damage_report_{report_id}.pdf"
+        (REPORTS_DIR / report_filename).write_bytes(pdf_bytes)
+        payload["report_url"] = f"/reports/{report_filename}"
+
     return json_success(payload, request=request, start_perf=request.state.start_perf)
+
+
+@app.get("/reports/{filename}")
+async def download_report(filename: str):
+    path = REPORTS_DIR / filename
+    if not path.exists() or path.suffix != ".pdf":
+        raise HTTPException(status_code=404, detail="Report not found.")
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=filename,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 def _load_image(path: Path):

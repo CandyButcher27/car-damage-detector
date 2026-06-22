@@ -45,5 +45,8 @@ rapidocr>=3.5.0
 arabic-reshaper>=3,<4
 python-bidi==0.6.10
 
+# --- PDF report generation ------------------------------------------------
+reportlab>=4.0,<5
+
 # --- Misc runtime ---------------------------------------------------------
 requests==2.34.2
