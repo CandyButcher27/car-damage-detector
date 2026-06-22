@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -1318,6 +1319,200 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# ── Spatial (box-aware) numeric extraction ──────────────────────────────────
+# The flat extractor (`_extract_mulkya_rulebased`) keyword-scans a list of
+# strings and mis-binds the numeric fields (engine cc reads the weight, year
+# reads the model-year, etc.) because it has thrown away the OCR geometry. The
+# Mulkiya is a fixed "value : label" card; binding each number to its Arabic
+# label by row geometry — then re-reading the value cell upscaled with the
+# digit recogniser — fixes cc / weights / seats / year. Ported from the
+# verified `prototype_spatial.py`; boxes are sourced through the production v3
+# OCR helpers so we inherit their rec_polys/dt_polys handling.
+
+_SPATIAL_NUMERIC_ENABLED = os.getenv("UPSURE_SPATIAL_NUMERIC", "1") not in ("0", "false", "False")
+_spatial_arabic_engine = None
+_spatial_digit_engine = None
+
+# Looser keyword fallbacks (OCR drops the leading label word often).
+_SPATIAL_KEYWORDS = {
+    "engine_cc": ["سعة المحرك", "المحرك سعة", "سعة"],
+    "empty_weight_kg": ["الوزن فارغ", "فارغ الوزن", "فارغ"],
+    "max_load_kg": ["الحمولة القصوى", "القصوى الحمولة", "الحمولة"],
+    "seats": ["عدد الركاب", "الركاب عدد", "الركاب"],
+    "year": ["سنة الصنع", "الصنع سنة", "الصنع", "الصعنع"],
+}
+_SPATIAL_RANGES = {
+    "engine_cc": (200, 9999),
+    "empty_weight_kg": (200, 9999),
+    "max_load_kg": (100, 99999),
+    "seats": (1, 80),
+    "year": (1980, 2030),
+}
+
+
+def _get_spatial_arabic_engine():
+    global _spatial_arabic_engine
+    if _spatial_arabic_engine is None:
+        _spatial_arabic_engine = _create_arabic_ocr_engine()
+    return _spatial_arabic_engine
+
+
+def _get_spatial_digit_engine():
+    """Default (ch+en) RapidOCR — reads Western digits better than the Arabic
+    recogniser, which fragments them. Used on the upscaled numeric cells."""
+    global _spatial_digit_engine
+    if _spatial_digit_engine is None:
+        _spatial_digit_engine = _create_ocr_engine()
+    return _spatial_digit_engine
+
+
+def _spatial_boxes(image_path: str) -> list[dict]:
+    """Arabic-engine OCR -> per-box dicts with bbox + reverse-fixed text."""
+    import numpy as np
+    raw = _normalize_lines(_run_ocr(_get_spatial_arabic_engine(), image_path))
+    out: list[dict] = []
+    for box, (txt, _conf) in raw:
+        b = np.asarray(box, dtype=float)
+        xs, ys = b[:, 0], b[:, 1]
+        out.append({
+            "cx": xs.mean(), "cy": ys.mean(),
+            "x0": xs.min(), "x1": xs.max(), "y0": ys.min(), "y1": ys.max(),
+            "text": _fix_reversed_arabic_runs(str(txt)),
+        })
+    return out
+
+
+def _spatial_rows(boxes: list[dict], tol_frac: float = 0.5) -> list[dict]:
+    """Cluster boxes into rows by y-center; each row ordered right->left (RTL)."""
+    import numpy as np
+    if not boxes:
+        return []
+    ys = sorted(b["cy"] for b in boxes)
+    med_gap = float(np.median(np.diff(ys))) if len(ys) > 1 else 20.0
+    tol = max(12.0, med_gap * tol_frac + 10)
+    rows: list[dict] = []
+    for b in sorted(boxes, key=lambda b: b["cy"]):
+        placed = False
+        for r in rows:
+            if abs(b["cy"] - r["y"]) <= tol:
+                r["items"].append(b)
+                r["y"] = float(np.mean([it["cy"] for it in r["items"]]))
+                placed = True
+                break
+        if not placed:
+            rows.append({"y": b["cy"], "items": [b]})
+    for r in rows:
+        r["items"].sort(key=lambda b: -b["cx"])  # right -> left
+    return rows
+
+
+def _spatial_read_digits(img, x0, x1, y0, y1, scale: int = 3, engine=None):
+    """Crop a value cell, upscale, OCR with the digit engine, return first int.
+
+    Digits are too small for reliable recognition at native res; a 3x bicubic
+    upscale pushes them above the recogniser's resolution floor. ``engine`` lets
+    the caller pass the primary (ch+en) RapidOCR it already loaded, avoiding a
+    second default-engine load."""
+    import cv2
+    H, W = img.shape[:2]
+    pad_y = (y1 - y0) * 0.4
+    yy0 = max(0, int(y0 - pad_y)); yy1 = min(H, int(y1 + pad_y))
+    xx0 = max(0, int(x0)); xx1 = min(W, int(x1))
+    if xx1 - xx0 < 8 or yy1 - yy0 < 8:
+        return None
+    cell = img[yy0:yy1, xx0:xx1]
+    big = cv2.resize(cell, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    res = (engine or _get_spatial_digit_engine())(big)
+    if res is None or not res.txts:
+        return None
+    txt = _convert_arabic_indic_digits_to_ascii(" ".join(res.txts))
+    nums = re.findall(r"\d{2,6}", txt)
+    return int(nums[0]) if nums else None
+
+
+def _boxes_from_lines(lines: list) -> list[dict]:
+    """Convert production `[(box,(text,conf))]` into spatial box dicts, applying
+    the reverse-fix the label matching expects. Lets the spatial pass reuse an
+    Arabic OCR result the caller already has instead of re-OCRing the page."""
+    import numpy as np
+    out: list[dict] = []
+    for box, (txt, _conf) in lines:
+        b = np.asarray(box, dtype=float)
+        xs, ys = b[:, 0], b[:, 1]
+        out.append({
+            "cx": xs.mean(), "cy": ys.mean(),
+            "x0": xs.min(), "x1": xs.max(), "y0": ys.min(), "y1": ys.max(),
+            "text": _fix_reversed_arabic_runs(str(txt)),
+        })
+    return out
+
+
+def _numeric_needs_spatial(data: dict) -> bool:
+    """Gate: only pay the extra Arabic OCR pass when the flat extractor's
+    numerics are missing or implausible. A fully-healthy flat read (every field
+    present and in range) skips spatial entirely. Trade-off: an in-range-but-
+    wrong value is not re-checked unless some other numeric also looks off."""
+    for field, (lo, hi) in _SPATIAL_RANGES.items():
+        v = data.get(field)
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi):
+            return True
+    return False
+
+
+def _extract_spatial_numeric(image_path: str, image_bgr, *, arabic_boxes=None, digit_engine=None) -> dict:
+    """Re-read the Mulkiya numeric fields by spatial label binding.
+
+    Returns only fields that resolved to a plausible value; callers should use
+    these to OVERRIDE the flat extractor's numeric guesses (which mis-bind).
+
+    ``arabic_boxes`` — reuse pre-extracted Arabic box dicts (skips the extra
+    full-page OCR when the caller already ran an Arabic pass).
+    ``digit_engine`` — reuse the caller's ch+en RapidOCR for the cell digit
+    reads (skips a second default-engine load).
+    """
+    boxes = arabic_boxes if arabic_boxes is not None else _spatial_boxes(image_path)
+    rows = _spatial_rows(boxes)
+    fields: dict[str, int] = {}
+
+    def find_label(keys):
+        for r in rows:
+            for idx, b in enumerate(r["items"]):
+                if any(k in b["text"] for k in keys):
+                    return r, idx
+        return None, None
+
+    def numeric_after_label(keys, lo, hi):
+        r, idx = find_label(keys)
+        if r is None:
+            return None
+        lbl = r["items"][idx]
+        h = lbl["y1"] - lbl["y0"]
+        neighbor = r["items"][idx + 1] if idx + 1 < len(r["items"]) else None
+        if neighbor is not None and (lbl["x0"] - neighbor["x1"]) < 4 * h:
+            # value is its own box just left of the label
+            x0, x1 = neighbor["x0"], neighbor["x1"]
+        else:
+            # value shares the label box, or no neighbour: window left of label
+            x0, x1 = lbl["x0"] - 3 * h, lbl["x0"]
+        val = _spatial_read_digits(image_bgr, x0, x1, lbl["y0"], lbl["y1"], engine=digit_engine)
+        if val is not None and lo <= val <= hi:
+            return val
+        # fallback: digits already present on the label / its left neighbour
+        cands = [lbl["text"]] + ([neighbor["text"]] if neighbor else [])
+        for cand in cands:
+            for d in re.findall(r"\d{1,6}", _convert_arabic_indic_digits_to_ascii(cand)):
+                if lo <= int(d) <= hi:
+                    return int(d)
+        return None
+
+    for field, keys in _SPATIAL_KEYWORDS.items():
+        lo, hi = _SPATIAL_RANGES[field]
+        val = numeric_after_label(keys, lo, hi)
+        if val is not None:
+            fields[field] = val
+    return fields
+
+
 def main() -> None:
     args = parse_args()
 
@@ -1803,6 +1998,36 @@ def main() -> None:
                 if isinstance(data["validation_notes"], list):
                     data["validation_notes"].append(f"auxiliary_arabic_ocr_failed: {exc}")
 
+        # Spatial numeric override: the flat extractor mis-binds cc / weights /
+        # seats / year. Re-read those from the card geometry, but only when the
+        # flat numerics look missing/implausible — a healthy flat read skips the
+        # extra Arabic OCR pass (see `_numeric_needs_spatial`). Reuse the
+        # already-loaded engines/boxes to avoid extra model loads.
+        spatial_overrides: dict[str, int] = {}
+        if _SPATIAL_NUMERIC_ENABLED and _numeric_needs_spatial(data):
+            try:
+                # Reuse the primary ch+en engine for digit reads; when the
+                # primary pass was already Arabic, reuse its boxes too.
+                reuse_boxes = _boxes_from_lines(raw_lines) if is_arabic else None
+                spatial = _extract_spatial_numeric(
+                    str(image_path), image_bgr,
+                    arabic_boxes=reuse_boxes,
+                    digit_engine=(engine if not is_arabic else None),
+                )
+                for field, val in spatial.items():
+                    if data.get(field) != val:
+                        spatial_overrides[field] = val
+                    data[field] = val
+            except Exception as exc:
+                data.setdefault("validation_notes", [])
+                if isinstance(data["validation_notes"], list):
+                    data["validation_notes"].append(f"spatial_numeric_failed: {exc}")
+        if spatial_overrides:
+            data.setdefault("validation_notes", [])
+            if isinstance(data["validation_notes"], list):
+                changed = ", ".join(f"{k}={v}" for k, v in spatial_overrides.items())
+                data["validation_notes"].append(f"spatial_numeric_override: {changed}")
+
         # Validate extracted data and add any inconsistency notes.
         _validate_and_note_data(data)
         data["quality"] = _assess_extraction_quality(data)
@@ -1816,6 +2041,7 @@ def main() -> None:
                     "auxiliary_ocr_lang": aux_ocr_lang,
                     "fix_arabic_reverse": fix_arabic_reverse,
                     "reshape_arabic": reshape_arabic,
+                    "spatial_numeric": _SPATIAL_NUMERIC_ENABLED,
                 }
             )
         out_json = image_path.with_name(f"{image_path.stem}_mulkya.json")
