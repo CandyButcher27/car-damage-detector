@@ -151,6 +151,39 @@ _ROTATIONS = (
 )
 
 
+def _header_score(crop: np.ndarray) -> float:
+    """How 'header-like' is the top strip? The Mulkiya front carries a light-blue
+    ROP header band + emblem across the top; the body is mostly white. The band
+    is more SATURATED and a touch DARKER than the body, so the correct (upright)
+    orientation maximises top-strip saturation. Pure pixel math — no OCR."""
+    h, w = crop.shape[:2]
+    if h < 10 or w < 10:
+        return -1.0
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    strip = max(1, int(h * 0.16))
+    top = hsv[:strip]
+    sat = float(top[:, :, 1].mean())            # higher on the coloured band
+    val_pen = float(top[:, :, 2].mean()) / 255.0  # white body is bright → penalise
+    return sat - 12.0 * val_pen
+
+
+def _orient_cheap(crop: np.ndarray) -> np.ndarray:
+    """Pick the upright orientation by header position — NO OCR.
+
+    Tries all 4 rotations and keeps the one whose top strip looks most like the
+    Mulkiya's coloured header band. Replaces the old 4x-OCR `_best_orientation`
+    for the orientation decision (aspect is already landscape-corrected in _warp,
+    so this mostly resolves the 0-vs-180 flip, but evaluating all 4 also rescues
+    an un-warped full-image fallback)."""
+    best = (crop, -1e9)
+    for _deg, rot in _ROTATIONS:
+        r = rot(crop)
+        sc = _header_score(r)
+        if sc > best[1]:
+            best = (r, sc)
+    return best[0]
+
+
 def _best_orientation(crop: np.ndarray) -> tuple[np.ndarray, bool, float]:
     """A warped card can land at 0/90/180/270. OCR all four; score = anchor
     present (dominant) + mean confidence. Return (oriented_crop, has_anchor, score).
@@ -172,29 +205,31 @@ def _best_orientation(crop: np.ndarray) -> tuple[np.ndarray, bool, float]:
 
 
 def choose_mulkiya_crop(img: np.ndarray) -> tuple[np.ndarray, str]:
-    """Return (best_crop, reason). Falls back to the full image, orientation-corrected."""
+    """Return (best_crop, reason). Orientation is resolved by the cheap pixel-based
+    header check (NO 4x-OCR). A single detected card costs zero OCR; only a
+    multi-card frame pays one OCR per candidate to pick the Mulkiya by anchor."""
     frame_area = img.shape[0] * img.shape[1]
     candidates = find_card_candidates(img)
     if not candidates:
-        oriented, _anchor, _s = _best_orientation(img)
-        return oriented, "no_quad->full_image(oriented)"
-    # Orientation-correct each candidate (smallest first — tight single cards),
-    # keep those carrying Mulkiya anchors.
+        return _orient_cheap(img), "no_quad->full_image(cheap)"
+    if len(candidates) == 1:
+        return _orient_cheap(candidates[0]), "single_card(cheap)"
+
+    # Multiple candidates: orient each cheaply, then a single OCR per candidate to
+    # find the one carrying Mulkiya anchors (isolates it from a second document).
     anchor_matches = []  # (oriented_crop, area)
     for c in sorted(candidates, key=lambda c: c.shape[0] * c.shape[1])[:6]:
-        oriented, anchor, _score = _best_orientation(c)
-        if anchor:
+        oriented = _orient_cheap(c)
+        text, _conf = _ocr(oriented)
+        if _has_mulkiya_anchor(text):
             anchor_matches.append((oriented, c.shape[0] * c.shape[1]))
     if anchor_matches:
-        # Prefer a genuinely isolated card (< 88% of the frame) over a near-full
-        # quad that may contain a second document; among those, the smallest.
         isolated = [(o, a) for (o, a) in anchor_matches if a < 0.88 * frame_area]
         pick = min(isolated or anchor_matches, key=lambda t: t[1])
         tag = "isolated" if isolated else "near_full"
-        return pick[0], f"{tag}_card_of_{len(anchor_matches)}_anchored(oriented)"
-    # No anchor match anywhere — use the largest quad (still deskews/crops bg).
-    oriented, _a, _s = _best_orientation(max(candidates, key=lambda c: c.shape[0] * c.shape[1]))
-    return oriented, "largest_quad_no_anchor(oriented)"
+        return pick[0], f"{tag}_card_of_{len(anchor_matches)}_anchored(cheap)"
+    # No anchor anywhere — largest quad, cheap-oriented.
+    return _orient_cheap(max(candidates, key=lambda c: c.shape[0] * c.shape[1])), "largest_quad_no_anchor(cheap)"
 
 
 def main() -> None:
