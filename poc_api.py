@@ -247,10 +247,14 @@ def _resolve_damage_model_path() -> Path:
 DAMAGE_MODEL_PATH = _resolve_damage_model_path()
 
 YOLO_SIZE = 640
-# YOLO detection confidence floor. Raised from 0.25 -> 0.50 in 1.1.1 to
-# stop low-confidence boxes (0.25-0.35 range) from surfacing in the
-# admin report as legitimate damage. Tunable via env.
-YOLO_CONF = _env_float_top("UPSURE_YOLO_CONF", 0.50)
+# YOLO detection confidence floor. The v3 detector (YOLO11m, CarDD) scores
+# well below v2 — real-damage boxes routinely land in the 0.25-0.45 band, so a
+# 0.50 floor surfaces NO boxes on most damaged views and everything collapses
+# to the `general-damage` fallback. Default is 0.25 to match the v3 score
+# distribution (the operational value already shipped in .env); raise via env
+# only if a labelled sweep shows false positives. (Was briefly 0.50 in 1.1.1
+# for the v2 detector.) Tunable via env.
+YOLO_CONF = _env_float_top("UPSURE_YOLO_CONF", 0.25)
 # NMS IoU — kept compile-time; rarely tuned per deployment.
 YOLO_IOU = _env_float_top("UPSURE_YOLO_IOU", 0.45)
 # damage_detector_v3 (YOLO11m, CarDD) emits classes in a different order/name
