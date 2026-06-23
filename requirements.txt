@@ -50,3 +50,6 @@ reportlab>=4.0,<5
 
 # --- Misc runtime ---------------------------------------------------------
 requests==2.34.2
+# Async HTTP client for the plate-recognizer sidecar (Option B). Used by
+# /predict/damage to fan out plate detection concurrently with damage inference.
+httpx>=0.27,<0.29

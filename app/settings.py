@@ -89,6 +89,18 @@ class Settings:
     damage_concurrency: int = _env_int("UPSURE_DAMAGE_CONCURRENCY", 4)
     ocr_concurrency: int = _env_int("UPSURE_OCR_CONCURRENCY", 2)
 
+    # Plate-recognizer sidecar (Option B: separate FastAPI on :9000).
+    # Called from /predict/damage for car-positive views, concurrently with
+    # the damage batch. Failure degrades gracefully (plate=null), never fails
+    # the damage view.
+    plate_detect_enabled: bool = _env_bool("UPSURE_PLATE_DETECT", True)
+    plate_service_url: str = os.getenv("UPSURE_PLATE_SERVICE_URL", "http://localhost:9000")
+    plate_timeout_seconds: float = _env_float("UPSURE_PLATE_TIMEOUT_SECONDS", 15.0)
+    plate_views: tuple[str, ...] = field(
+        default_factory=lambda: tuple(_env_list("UPSURE_PLATE_VIEWS", ["front", "back"]))
+    )
+    plate_is_oman_default: bool = _env_bool("UPSURE_PLATE_IS_OMAN", False)
+
 
 SETTINGS = Settings()
 

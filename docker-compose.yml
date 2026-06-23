@@ -1,9 +1,13 @@
-# Local docker-compose for end-to-end smoke testing.
+# Local docker-compose for end-to-end smoke testing — builds BOTH services:
+#   - data-ingestion (:8000)  main API
+#   - plate-recognizer (:9000) ANPR sidecar (Option B)
 #
 #   docker compose up --build
 #   curl http://localhost:8000/livez
+#   curl http://localhost:9000/health
 #
-# Models are mounted from the host so the image stays small.
+# Models are mounted from the host so both images stay small. In prod these
+# run as separate k8s deployments; the memory limits below are per-container.
 version: "3.9"
 
 services:
@@ -22,12 +26,18 @@ services:
       UPSURE_LOG_JSON: "false"
       UPSURE_PRELOAD_MODELS: "false"
       UPSURE_REQUIRE_MODELS_FOR_READY: "false"
+      # Plate sidecar is reachable by service name on the compose network.
+      UPSURE_PLATE_DETECT: "true"
+      UPSURE_PLATE_SERVICE_URL: "http://plate-recognizer:9000"
       # Override paths if your local model artefacts use the digiLifeDoc_* names.
       # UPSURE_DAMAGE_MODEL: /app/models/digiLifeDoc_damage_model.onnx
       # UPSURE_YOLO_MODEL:   /app/models/digiLifeDoc_damage_detector_v3.onnx
     volumes:
       - ./models:/app/models:ro
       - ./Samples:/app/Samples:ro
+    depends_on:
+      plate-recognizer:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/livez"]
       interval: 30s
@@ -40,4 +50,31 @@ services:
           memory: 4G
         reservations:
           memory: 2G
+    restart: unless-stopped
+
+  plate-recognizer:
+    build:
+      context: ./plate-recognizer
+      dockerfile: Dockerfile
+    image: upsure/plate-recognizer:dev
+    container_name: upsure-plate-recognizer
+    ports:
+      - "9000:9000"
+    environment:
+      ANPR_MODEL_PATH: /app/models/digiLifeDoc_yolov4_plate_detector.onnx
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+    volumes:
+      - ./models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+        reservations:
+          memory: 1500M
     restart: unless-stopped

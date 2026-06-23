@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Literal
 from xml.etree import ElementTree
 
+import httpx
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -375,8 +376,20 @@ DAMAGE_CB = CircuitBreaker(
     recovery_seconds=SETTINGS.cb_recovery_seconds,
     half_open_max_calls=SETTINGS.cb_half_open_max_calls,
 )
+# Plate-recognizer sidecar (network downstream). Trips off on repeated
+# failures so a dead sidecar doesn't add latency to every damage request.
+PLATE_CB = CircuitBreaker(
+    name="plate_sidecar",
+    failure_threshold=SETTINGS.cb_failure_threshold,
+    recovery_seconds=SETTINGS.cb_recovery_seconds,
+    half_open_max_calls=SETTINGS.cb_half_open_max_calls,
+)
 
-_CIRCUITS: tuple[CircuitBreaker, ...] = (OCR_CB, YOLO_CB, DAMAGE_CB)
+_CIRCUITS: tuple[CircuitBreaker, ...] = (OCR_CB, YOLO_CB, DAMAGE_CB, PLATE_CB)
+
+# Shared async HTTP client for the plate sidecar, created in the lifespan and
+# closed on shutdown (None when plate detection is disabled).
+_plate_client: httpx.AsyncClient | None = None
 
 
 # ── Bulkheads ──────────────────────────────────────────────────────────────
@@ -1513,6 +1526,7 @@ async def lifespan(app: FastAPI):
     set_model_readiness("car_classifier", False)
     set_model_readiness("card_noncard", False)
     set_model_readiness("mulkiya_classifier", False)
+    set_model_readiness("plate_sidecar", False)
 
     log.info(
         "service starting",
@@ -1543,6 +1557,16 @@ async def lifespan(app: FastAPI):
                     extra={"event": "model.preload_failed", "model": label, "exception": repr(exc)},
                 )
 
+    # Plate sidecar HTTP client (Option B). One shared async client; the sidecar
+    # is a separate container, so this is the only outbound dependency.
+    global _plate_client
+    if SETTINGS.plate_detect_enabled:
+        _plate_client = httpx.AsyncClient(timeout=SETTINGS.plate_timeout_seconds)
+        log.info(
+            "plate sidecar enabled",
+            extra={"event": "plate.enabled", "url": SETTINGS.plate_service_url},
+        )
+
     # Background circuit-state metric publisher (tiny, no asyncio.sleep loop —
     # we just publish once; subsequent state changes update via set_circuit_state
     # from CircuitBreaker callers).
@@ -1553,6 +1577,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("service stopping", extra={"event": "service.stop"})
+        if _plate_client is not None:
+            await _plate_client.aclose()
 
 
 # ── FastAPI app ─────────────────────────────────────────────────────────────
@@ -1646,6 +1672,30 @@ def _check_card_model() -> ComponentStatus:
         return ComponentStatus("card_noncard", False, critical=False, detail=str(exc), extra={"path": str(MODEL_PATH)})
 
 
+async def _check_plate_service() -> ComponentStatus:
+    if not SETTINGS.plate_detect_enabled:
+        return ComponentStatus(
+            "plate_sidecar", True, critical=False, detail="disabled",
+            extra={"url": SETTINGS.plate_service_url},
+        )
+    try:
+        client = _plate_client or httpx.AsyncClient(timeout=SETTINGS.plate_timeout_seconds)
+        try:
+            resp = await client.get(f"{SETTINGS.plate_service_url}/health", timeout=3.0)
+            resp.raise_for_status()
+        finally:
+            if _plate_client is None:
+                await client.aclose()
+        set_model_readiness("plate_sidecar", True)
+        return ComponentStatus("plate_sidecar", True, critical=False, extra={"url": SETTINGS.plate_service_url})
+    except Exception as exc:
+        set_model_readiness("plate_sidecar", False)
+        return ComponentStatus(
+            "plate_sidecar", False, critical=False, detail=str(exc),
+            extra={"url": SETTINGS.plate_service_url},
+        )
+
+
 def _check_circuits() -> ComponentStatus:
     snapshots = [cb.snapshot() for cb in _CIRCUITS]
     # Surface circuit state into Prometheus on every probe — cheap and
@@ -1664,6 +1714,7 @@ health_registry.register("damage_binary", _check_damage_model)
 health_registry.register("yolo_damage", _check_yolo_model)
 health_registry.register("car_classifier", _check_car_model)
 health_registry.register("card_noncard", _check_card_model)
+health_registry.register("plate_sidecar", _check_plate_service)
 health_registry.register("circuits", _check_circuits)
 
 
@@ -2215,6 +2266,63 @@ def _damage_batch_for_views(
     return out
 
 
+async def _plate_detect_one(view: str, img_bytes: bytes, is_oman: bool) -> dict[str, Any] | None:
+    """Call the plate sidecar for a single view. Returns None on any failure.
+
+    Plate detection is additive — a sidecar timeout / error / open circuit must
+    never fail the damage view, so every failure path collapses to None.
+    """
+    if _plate_client is None:
+        return None
+
+    async def _post() -> dict[str, Any]:
+        resp = await _plate_client.post(
+            f"{SETTINGS.plate_service_url}/detect",
+            files={"image": (f"{view}.jpg", img_bytes, "image/jpeg")},
+            data={"is_oman_plate": "true" if is_oman else "false", "skip_annotated": "true"},
+            timeout=SETTINGS.plate_timeout_seconds,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        result = await PLATE_CB.acall(_post)
+    except Exception as exc:
+        log.warning(
+            "plate sidecar call failed; skipping plate for view",
+            extra={"event": "plate.failed", "view": view, "exception": repr(exc)},
+        )
+        return None
+
+    return {
+        "plate_text": result.get("plate_text") or None,
+        "confidence": round(float(result.get("confidence", 0.0)), 4),
+        "detected": bool(result.get("detected")),
+        "num_plates": int(result.get("num_plates", 0)),
+    }
+
+
+async def _plate_for_views(
+    view_img_bytes: dict[str, bytes],
+    is_oman: bool,
+) -> dict[str, dict[str, Any] | None]:
+    """Fan out plate detection over the configured views (front/back by default).
+
+    Runs as a coroutine so it overlaps the threadpool damage batch via
+    asyncio.gather — the sidecar does its work in its own process, so this is
+    real parallelism, not GIL-bound.
+    """
+    if not SETTINGS.plate_detect_enabled or _plate_client is None:
+        return {}
+    targets = [v for v in view_img_bytes if v in SETTINGS.plate_views]
+    if not targets:
+        return {}
+    results = await asyncio.gather(
+        *(_plate_detect_one(v, view_img_bytes[v], is_oman) for v in targets)
+    )
+    return dict(zip(targets, results))
+
+
 def _damage_denies(cls: str, severity: str) -> bool:
     """Does a single damage (class + severity) block policy issuance?"""
     if cls in POLICY_IGNORE_CLASSES:
@@ -2260,6 +2368,7 @@ async def predict_damage(
     left:  UploadFile | None = File(default=None),
     right: UploadFile | None = File(default=None),
     report: bool = Query(default=False, description="Set true to receive a PDF damage report instead of JSON"),
+    is_oman_plate: bool = Query(default=SETTINGS.plate_is_oman_default, description="Use Oman-specific plate OCR cropping in the plate sidecar"),
 ):
     views: dict[str, UploadFile] = {
         k: v for k, v in [("front", front), ("back", back), ("left", left), ("right", right)] if v
@@ -2318,12 +2427,21 @@ async def predict_damage(
         }
         return json_success(payload, request=request, start_perf=request.state.start_perf)
 
-    # Phase 2: batched damage inference (single ORT call for N views).
+    # Phase 2: batched damage inference (single ORT call for N views), with the
+    # plate sidecar fanned out concurrently — separate process, real overlap.
     async with _damage_bulkhead:
-        damage_batch, = await asyncio.gather(
+        damage_batch, plate_results = await asyncio.gather(
             run_in_threadpool(_damage_batch_for_views, view_img_bytes, yolo_available),
+            _plate_for_views(view_img_bytes, is_oman_plate),
             return_exceptions=True,
         )
+
+    if isinstance(plate_results, Exception):
+        log.warning(
+            "plate fan-out failed; continuing without plate data",
+            extra={"event": "plate.batch_failed", "exception": repr(plate_results)},
+        )
+        plate_results = {}
 
     # Aggregate damage results
     per_view: dict[str, Any] = {}
@@ -2353,6 +2471,11 @@ async def predict_damage(
                 score = result.get("confidence_score", 0.0)
                 if score > max_confidence:
                     max_confidence = score
+
+    # Attach plate results (additive; None when the sidecar had nothing/failed).
+    for view_name, plate in plate_results.items():
+        if view_name in per_view:
+            per_view[view_name]["plate"] = plate
 
     record_pipeline_latency("predict_damage", time.perf_counter() - pipeline_start)
 

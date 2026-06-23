@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -316,6 +316,75 @@ def test_no_damage_returns_empty_damages_list():
     assert data["damage_detected"] is False
     assert data["overall_confidence"] == 0.0
     assert data["per_view"]["front"]["damages"] == []
+
+
+# ── /predict/damage ─ plate sidecar (Option B) ───────────────────────────────
+def test_plate_for_views_noop_without_client():
+    """No HTTP client (disabled / not started) → empty result, no calls."""
+    import asyncio
+    assert poc_api._plate_client is None
+    out = asyncio.run(poc_api._plate_for_views({"front": b"x", "back": b"y"}, False))
+    assert out == {}
+
+
+def test_plate_for_views_filters_to_configured_views():
+    """Only front/back are queried; left/right are skipped (plates live there)."""
+    import asyncio
+    queried: list[str] = []
+
+    async def fake_one(view, img, is_oman):
+        queried.append(view)
+        return {"plate_text": "X", "confidence": 0.9, "detected": True, "num_plates": 1}
+
+    with (
+        patch("poc_api._plate_client", MagicMock()),
+        patch("poc_api._plate_detect_one", side_effect=fake_one),
+    ):
+        out = asyncio.run(
+            poc_api._plate_for_views({"front": b"f", "left": b"l"}, False)
+        )
+    assert set(out.keys()) == {"front"}
+    assert queried == ["front"]
+
+
+def test_damage_attaches_plate_block():
+    plate = {"plate_text": "12345 AB", "confidence": 0.94, "detected": True, "num_plates": 1}
+    with (
+        patch("poc_api._get_damage_session"),
+        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
+        patch("poc_api._plate_for_views", AsyncMock(return_value={"front": plate})),
+    ):
+        resp = client.post("/predict/damage", files={"front": _car_file()})
+    assert resp.status_code == 200
+    assert ok(resp)["per_view"]["front"]["plate"] == plate
+
+
+def test_damage_plate_null_on_sidecar_failure():
+    """Sidecar failure for a view → plate=None, damage result untouched."""
+    with (
+        patch("poc_api._get_damage_session"),
+        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
+        patch("poc_api._plate_for_views", AsyncMock(return_value={"front": None})),
+    ):
+        resp = client.post("/predict/damage", files={"front": _car_file()})
+    assert resp.status_code == 200
+    front = ok(resp)["per_view"]["front"]
+    assert front["plate"] is None
+    assert "damage_detected" in front
+
+
+def test_damage_survives_plate_batch_exception():
+    """A blanket plate fan-out exception must not fail the damage request."""
+    with (
+        patch("poc_api._get_damage_session"),
+        patch("poc_api._run_damage_inference_batch", side_effect=_mock_damage_batch),
+        patch("poc_api._plate_for_views", AsyncMock(side_effect=RuntimeError("sidecar boom"))),
+    ):
+        resp = client.post("/predict/damage", files={"front": _car_file()})
+    assert resp.status_code == 200
+    front = ok(resp)["per_view"]["front"]
+    assert "damage_detected" in front
+    assert "plate" not in front  # batch failed → no plate merged
 
 
 # ── Policy decision matrix ──────────────────────────────────────────────────
