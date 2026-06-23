@@ -44,6 +44,15 @@ data:
   # 0.50 surfaced no boxes. Re-tune from a labelled set via the threshold sweep.
   UPSURE_YOLO_CONF: "0.25"
 
+  # --- Plate-recognizer sidecar (separate Deployment + Service) ---
+  # Reached via the in-cluster Service DNS. Set to "false" to disable plate
+  # detection (damage still works; per_view.plate is simply omitted).
+  UPSURE_PLATE_DETECT: "true"
+  UPSURE_PLATE_SERVICE_URL: "http://plate-recognizer:9000"
+  UPSURE_PLATE_TIMEOUT_SECONDS: "15"
+  UPSURE_PLATE_VIEWS: "front,back"
+  UPSURE_PLATE_IS_OMAN: "false"
+
   # --- OCR ---
   UPSURE_OCR_PYTHON: "/usr/local/bin/python"
   UPSURE_OCR_SUBPROCESS_TIMEOUT_SECONDS: "90"
