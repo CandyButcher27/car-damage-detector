@@ -2398,7 +2398,12 @@ async def predict_damage(
             if _is_pdf(upload):
                 norm_bytes, _ = _pdf_first_page_to_jpeg(raw)
             else:
-                norm_bytes, _ = _image_bytes_to_format(raw, output_format="JPEG")
+                # PNG (lossless) — NOT JPEG. The YOLO11m v3 localizer is brittle
+                # to lossy artefacts: a JPEG q95 re-encode alone can drop a real
+                # damage box's score from ~0.43 to ~0.15 and collapse the view to
+                # `general-damage`. We still normalise (EXIF rotation, RGB) but
+                # without the generation loss. PDFs stay JPEG (already rasterised).
+                norm_bytes, _ = _image_bytes_to_format(raw, output_format="PNG")
             view_img_bytes[view_name] = norm_bytes
         except ApiError:
             raise
