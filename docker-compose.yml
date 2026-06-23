@@ -60,9 +60,11 @@ services:
     container_name: upsure-plate-recognizer
     ports:
       - "9000:9000"
-    environment:
-      ANPR_MODEL_PATH: /app/models/digiLifeDoc_yolov4_plate_detector.onnx
-      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+    # Shares the single root .env with data-ingestion — one file deploys both.
+    # The sidecar only reads ANPR_MODEL_PATH + PROTOCOL_BUFFERS_*; it ignores
+    # the UPSURE_* keys.
+    env_file:
+      - .env
     volumes:
       - ./models:/app/models:ro
     healthcheck:
