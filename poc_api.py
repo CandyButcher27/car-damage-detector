@@ -562,7 +562,7 @@ def _get_mulkiya_classifier() -> BinaryOnnxImageClassifier | None:
                 MULKIYA_MODEL_PATH,
                 positive_label="front",
                 negative_label="back",
-                positive_when_output_high=_env_bool("UPSURE_MULKIYA_FRONT_HIGH", True),
+                positive_when_output_high=_env_bool("UPSURE_MULKIYA_FRONT_HIGH", False),
             )
             set_model_readiness("mulkiya_classifier", True)
         except Exception as exc:
