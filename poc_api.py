@@ -402,9 +402,50 @@ _yolo_session: ort.InferenceSession | None = None
 _mulkiya_classifier: BinaryOnnxImageClassifier | None = None
 
 
+_CARD_ONNX_CANDIDATES = [
+    "models/card_noncard_classifier_model.onnx",
+    "models/digiLifeDoc_card_noncard_classifier_model.onnx",
+]
+
+
+def _resolve_card_onnx() -> Path | None:
+    for candidate in _CARD_ONNX_CANDIDATES:
+        path = POC_DIR / candidate
+        if path.exists():
+            return path
+    return None
+
+
+class _OnnxCardModel:
+    """ONNX card/non-card classifier exposing the same predict_probability
+    interface as the legacy keras CardNonCardModel, so the rest of the pipeline
+    is agnostic to which backend loaded."""
+
+    def __init__(self, path: Path) -> None:
+        self._clf = BinaryOnnxImageClassifier(
+            path,
+            positive_label="card",
+            negative_label="not_card",
+            positive_when_output_high=_env_bool("UPSURE_CARD_MODEL_POSITIVE_HIGH", True),
+        )
+
+    def predict_probability(self, image: Image.Image, normalize: bool = True) -> float:
+        return float(self._clf.probabilities(image)["card_probability"])
+
+
 @retry(attempts=3, base_delay=0.5, max_delay=4.0)
-def _load_card_model() -> CardNonCardModel:
-    return CardNonCardModel.load(MODEL_PATH)
+def _load_card_model():
+    # Prefer ONNX (what the repo ships and runs in prod); fall back to the legacy
+    # pure-NumPy .keras model only if no ONNX artefact is present. Mirrors
+    # _load_car_model's ONNX-first resolution.
+    onnx_path = _resolve_card_onnx()
+    if onnx_path is not None:
+        return _OnnxCardModel(onnx_path)
+    if MODEL_PATH.exists():
+        return CardNonCardModel.load(MODEL_PATH)
+    raise FileNotFoundError(
+        f"No card model found: no ONNX in {_CARD_ONNX_CANDIDATES} and no {MODEL_PATH}"
+    )
 
 
 @retry(attempts=3, base_delay=0.5, max_delay=4.0)
@@ -1952,7 +1993,7 @@ async def process_document(
             # gate can be disabled with UPSURE_MULKIYA_SIDE_GATE=0.
             if not is_pdf_file:
                 gate = _mulkiya_front_gate(
-                    label, mulkiya_side, _env_bool("UPSURE_MULKIYA_SIDE_GATE", True)
+                    label, mulkiya_side, True
                 )
                 if gate is not None:
                     reason, message = gate
