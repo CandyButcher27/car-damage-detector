@@ -2620,42 +2620,6 @@ def main() -> None:
                 if isinstance(data["validation_notes"], list):
                     data["validation_notes"].append(f"auxiliary_ocr_failed: {exc}")
 
-        # Fields the Arabic pass extracts better because their VALUE sits next
-        # to an Arabic LABEL (the English pass sees only bare numbers/text with
-        # no label to bind to).
-        # Fields the Arabic pass extracts better because their VALUE sits next
-        # to an Arabic LABEL (the English pass sees only bare text with no label
-        # to bind to). Numeric fields are intentionally NOT merged from Arabic:
-        # the Arabic recogniser fragments digits worse than the English one, so
-        # an Arabic-bound number is usually less accurate than the English read.
-        arabic_text_fields = ("vehicle_type", "make", "model", "color", "country_of_origin")
-        if not is_arabic and any(data.get(field) in (None, "") for field in arabic_text_fields):
-            try:
-                ara_engine = _create_arabic_ocr_engine()
-                ara_result = _run_ocr(ara_engine, str(image_path), use_cls=args.use_angle_cls)
-                ara_raw_lines = _normalize_lines(ara_result)
-                ara_lines = [
-                    (box, (_fix_reversed_arabic_runs(text), conf))
-                    for box, (text, conf) in ara_raw_lines
-                ]
-                ara_ordered: list[str] = []
-                for _box, (text, confidence) in _sort_lines(ara_lines, rtl=True):
-                    if float(confidence) >= args.min_conf:
-                        nt = _normalize_for_translation(text)
-                        if nt:
-                            ara_ordered.append(nt)
-                if ara_ordered:
-                    ara_data = _extract_mulkya_rulebased(ara_ordered)
-                    for field in arabic_text_fields:
-                        if data.get(field) in (None, "") and ara_data.get(field) not in (None, ""):
-                            data[field] = ara_data[field]
-                    if any(data.get(f) not in (None, "") for f in arabic_text_fields):
-                        aux_ocr_lang = (aux_ocr_lang + "+ar") if aux_ocr_lang else "ar"
-            except Exception as exc:
-                data.setdefault("validation_notes", [])
-                if isinstance(data["validation_notes"], list):
-                    data["validation_notes"].append(f"auxiliary_arabic_ocr_failed: {exc}")
-
         # Positional-template extractor (AUTHORITATIVE for numerics/dates).
         # Deskew/orient the card first, then bind each value to its field by
         # card-relative position (fixed Mulkiya-front layout). This is what the
