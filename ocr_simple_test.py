@@ -82,6 +82,24 @@ def _create_ocr_engine():
     return RapidOCR()
 
 
+_ENGINE = None
+
+
+def _get_engine():
+    """Process-wide singleton RapidOCR engine. Loading the det/cls/rec ONNX
+    models costs ~4s; in-process callers (the API) reuse one engine across
+    requests instead of paying that on every call."""
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _create_ocr_engine()
+    return _ENGINE
+
+
+def preload() -> None:
+    """Warm the singleton engine (and its lazy recogniser) once at startup."""
+    _get_engine()
+
+
 def _run_ocr(engine, image, *, use_cls: bool = True):
     """Run RapidOCR v3 and return output in PaddleOCR 2.x-compatible format."""
     result = engine(image, use_cls=use_cls)
@@ -505,6 +523,46 @@ def _assess_extraction_quality(data: dict) -> dict:
         "message": message,
         "field_checks": checks,
     }
+
+
+def _numeric_fields_complete(data: dict) -> bool:
+    """True when the cheap (full-image + range) read already has every
+    template-relevant field as a valid value, so the expensive positional-
+    template crop/orient/refine pass (~6s) can be skipped. Conservative: any
+    missing or out-of-range field returns False and the template runs.
+
+    NOTE: trades a little binding accuracy for latency — on a clean card the
+    range extractor can mis-bind `seats` (it may read the axle count). The
+    template would correct that, but only fires here when something looks off."""
+    def _vin_ok(v) -> bool:
+        if not isinstance(v, str):
+            return False
+        s = re.sub(r"[^A-Za-z0-9]", "", v)
+        return len(s) == 17 and any(c.isalpha() for c in s) and any(c.isdigit() for c in s)
+
+    def _plate_ok(v) -> bool:
+        return v not in (None, "") and 3 <= len(re.sub(r"\D", "", str(v))) <= 7
+
+    def _rng(v, lo, hi) -> bool:
+        try:
+            return lo <= int(v) <= hi
+        except (TypeError, ValueError):
+            return False
+
+    def _date_ok(v) -> bool:
+        return isinstance(v, str) and bool(re.fullmatch(r"\d{2,4}/\d{1,2}/\d{1,2}", v))
+
+    return (
+        _plate_ok(data.get("plate_number"))
+        and _vin_ok(data.get("vin_or_chassis"))
+        and _rng(data.get("engine_cc"), 200, 10000)
+        and _rng(data.get("empty_weight_kg"), 100, 10000)
+        and _rng(data.get("max_load_kg"), 100, 100000)
+        and _rng(data.get("seats"), 1, 9)
+        and _rng(data.get("year"), 1980, 2030)
+        and _date_ok(data.get("issue_date"))
+        and _date_ok(data.get("expiry_date"))
+    )
 
 
 def _group_ocr_lines_by_field(lines: list[str]) -> dict[str, list[str]]:
@@ -1803,7 +1861,7 @@ def _translate_texts_argos(texts: list[str], from_code: str, to_code: str) -> li
     return out
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Simple PaddleOCR image/PDF test")
     parser.add_argument(
         "input",
@@ -1969,11 +2027,11 @@ def parse_args() -> argparse.Namespace:
             "fallback: re-run extraction on the crop when the original is unusable."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    args = parse_args(argv)
 
     is_arabic = args.lang.lower() in {"ar", "arabic"}
     fix_arabic_reverse = is_arabic and args.fix_arabic_reverse and (not args.no_fix_arabic_reverse)
@@ -2003,7 +2061,7 @@ def main() -> None:
     import cv2
     import numpy as np
 
-    engine = _create_ocr_engine()
+    engine = _get_engine()
 
     # ------------------------------------------------------------------
     # postprocess() — call this on every raw OCR text string right after
@@ -2421,11 +2479,6 @@ def main() -> None:
                 if isinstance(data["validation_notes"], list):
                     data["validation_notes"].append(f"auxiliary_ocr_failed: {exc}")
 
-        # Positional-template extractor (AUTHORITATIVE for numerics/dates).
-        # Deskew/orient the card first, then bind each value to its field by
-        # card-relative position (fixed Mulkiya-front layout). This is what the
-        # user asked for: straighten, then read by geometry — robust to rotation,
-        # which broke the range extractor's absolute y-position logic.
         # Template field names → existing JSON schema names.
         _TEMPLATE_TO_SCHEMA = {
             "plate_number": "plate_number",
@@ -2444,12 +2497,51 @@ def main() -> None:
         # Position-AMBIGUOUS fields: bare integers with overlapping ranges that
         # can ONLY be told apart by card position. When the anchor frame is
         # confident we trust it exclusively for these — a blank beats a wrong
-        # guess from the flat/range extractors (which is what the user asked for:
-        # position, not number-guessing).
+        # guess from the flat/range extractors.
         _AMBIGUOUS_FIELDS = ("engine_cc", "empty_weight_kg", "max_load_kg", "seats", "year", "model_year")
         template_set: set[str] = set()
         template_confident = False
-        if _TEMPLATE_EXTRACTOR_ENABLED and not is_arabic:
+
+        # Range-based numeric extractor runs FIRST — it reuses the full-image OCR
+        # boxes (no extra OCR pass, ~free) and handles the detector cell-merge for
+        # weights (5201060 → 520 + 1060). On a clean upright card it fills every
+        # numeric, which lets us skip the expensive positional-template pass below.
+        if _RANGE_EXTRACTOR_ENABLED:
+            try:
+                range_data = _extract_by_range_with_boxes(lines, image_bgr, engine)
+                range_overrides: dict = {}
+                _range_fields = (
+                    'plate_number', 'vin_or_chassis', 'year', 'model_year',
+                    'engine_cc', 'empty_weight_kg', 'max_load_kg', 'seats',
+                    'issue_date', 'expiry_date',
+                )
+                for field in _range_fields:
+                    if range_data.get(field) is not None:
+                        if range_data[field] != data.get(field):
+                            range_overrides[field] = range_data[field]
+                        data[field] = range_data[field]
+                # If range extractor found no seats, invalidate flat extractor's
+                # out-of-range value (flat extractor has no geometry and often
+                # picks arbitrary numbers in 1-80).
+                if range_data.get('seats') is None and isinstance(data.get('seats'), int) and not (1 <= data['seats'] <= 9):
+                    data['seats'] = None
+                if range_overrides:
+                    data.setdefault("validation_notes", [])
+                    if isinstance(data["validation_notes"], list):
+                        changed = ", ".join(f"{k}={v}" for k, v in range_overrides.items())
+                        data["validation_notes"].append(f"range_extractor_override: {changed}")
+            except Exception as exc:
+                data.setdefault("validation_notes", [])
+                if isinstance(data["validation_notes"], list):
+                    data["validation_notes"].append(f"range_extractor_failed: {exc}")
+
+        # Positional-template extractor (AUTHORITATIVE for numerics/dates) — it
+        # deskews/orients the card and re-OCRs a crop plus each field cell, which
+        # costs ~6s. The cheap full-image + range read above is already correct on
+        # clean upright cards, so only pay the template when that read is missing
+        # or has an out-of-range field (rotated / multi-doc / noisy frames). When
+        # it runs it OVERRIDES the range values (template > range > flat).
+        if _TEMPLATE_EXTRACTOR_ENABLED and not is_arabic and not _numeric_fields_complete(data):
             try:
                 import card_crop
                 crop, crop_reason = card_crop.choose_mulkiya_crop(image_bgr)
@@ -2469,8 +2561,8 @@ def main() -> None:
                         tmpl_overrides[sfield] = val
                     data[sfield] = val
                     template_set.add(sfield)
-                # Confident frame → drop the flat extractor's guesses for any
-                # ambiguous field the template left blank (prefer blank to wrong).
+                # Confident frame → drop the range/flat guesses for any ambiguous
+                # field the template left blank (prefer blank to wrong).
                 if template_confident:
                     for f in _AMBIGUOUS_FIELDS:
                         if f not in template_set:
@@ -2484,44 +2576,6 @@ def main() -> None:
                 data.setdefault("validation_notes", [])
                 if isinstance(data["validation_notes"], list):
                     data["validation_notes"].append(f"template_extractor_failed: {exc}")
-
-        # Range-based numeric extractor: fallback that fills only fields the
-        # template did NOT bind. Uses value ranges + y-position; handles the
-        # detector cell-merge for weights (5201060 → 520 + 1060). Precedence:
-        # template > range > flat keyword extractor. When the anchor frame is
-        # confident, range is NOT allowed to guess the ambiguous numerics.
-        if _RANGE_EXTRACTOR_ENABLED:
-            try:
-                range_data = _extract_by_range_with_boxes(lines, image_bgr, engine)
-                range_overrides: dict = {}
-                _range_fields = (
-                    'plate_number', 'vin_or_chassis', 'year', 'model_year',
-                    'engine_cc', 'empty_weight_kg', 'max_load_kg', 'seats',
-                    'issue_date', 'expiry_date',
-                )
-                for field in _range_fields:
-                    if field in template_set:
-                        continue  # template owns this field
-                    if template_confident and field in _AMBIGUOUS_FIELDS:
-                        continue  # no guessing the ambiguous fields under a good frame
-                    if range_data.get(field) is not None:
-                        if range_data[field] != data.get(field):
-                            range_overrides[field] = range_data[field]
-                        data[field] = range_data[field]
-                # If range extractor found no seats, invalidate flat extractor's
-                # out-of-range value (flat extractor has no geometry and often
-                # picks arbitrary numbers in 1-80).
-                if range_data.get('seats') is None and isinstance(data.get('seats'), int) and not (1 <= data['seats'] <= 9):
-                    data['seats'] = None
-                if range_overrides:
-                    data.setdefault("validation_notes", [])
-                    if isinstance(data["validation_notes"], list):
-                        changed = ", ".join(f"{k}={v}" for k, v in range_overrides.items())
-                        data["validation_notes"].append(f"range_extractor_override: {changed}")
-            except Exception as exc:
-                data.setdefault("validation_notes", [])
-                if isinstance(data["validation_notes"], list):
-                    data["validation_notes"].append(f"range_extractor_failed: {exc}")
 
         # Validate extracted data and add any inconsistency notes.
         _validate_and_note_data(data)

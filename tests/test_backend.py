@@ -447,14 +447,12 @@ def test_circuit_breaker_blocks_calls_when_open():
     cb.reset()
 
 
-# ── Resilience: subprocess timeout maps to DEPENDENCY_TIMEOUT ───────────────
-def test_ocr_timeout_returns_504_with_envelope():
-    import subprocess
+# ── Resilience: an OCR failure maps to a clean error envelope ───────────────
+def test_ocr_failure_returns_error_envelope():
+    def _boom(*args, **kwargs):
+        raise RuntimeError("ocr blew up")
 
-    def _slow(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd="ocr", timeout=1)
-
-    with patch("poc_api._ocr_subprocess", side_effect=_slow):
+    with patch("poc_api._ocr_invoke", side_effect=_boom):
         resp = client.post(
             "/api/v1/process",
             files={"file": _car_file("doc.jpg")},

@@ -28,8 +28,6 @@ import io
 import json
 import mimetypes
 import os
-import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -58,7 +56,6 @@ Image.MAX_IMAGE_PIXELS = 64_000_000
 
 from app.errors import (
     ApiError,
-    DependencyTimeoutError,
     ErrorCode,
     ModelUnavailableError,
     PipelineFailureError,
@@ -83,6 +80,7 @@ from damage_report import generate_damage_report
 from app.settings import SETTINGS, repo_root
 
 from card_inference import CardNonCardModel, _resolve_model_path
+import ocr_simple_test as ocr_worker
 from onnx_inference import BinaryOnnxImageClassifier
 from rag_json_chunker import chunk_json_file
 
@@ -122,7 +120,6 @@ if load_keras_model is not None:
 
 # ── Paths / constants ──────────────────────────────────────────────────────
 POC_DIR = repo_root()
-OCR_SCRIPT = POC_DIR / "ocr_simple_test.py"
 REPORTS_DIR = POC_DIR / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
@@ -199,12 +196,6 @@ DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.25)
 DAMAGE_IMG_SIZE = 260
 DAMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DAMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-OCR_PYTHON_DEFAULT = Path("D:/UpSure/OCR_test/venv/Scripts/python.exe")
-if not OCR_PYTHON_DEFAULT.exists():
-    OCR_PYTHON_DEFAULT = POC_DIR.parent / "OCR_test" / "venv" / "Scripts" / "python.exe"
-
-OCR_PYTHON = Path(os.getenv("UPSURE_OCR_PYTHON", str(OCR_PYTHON_DEFAULT)))
 
 # Default raised from 0.35 → 0.65 after a false-positive at conf 0.636 on
 # Non_card_image_1.jpeg. Tunable per-deployment without redeploy via
@@ -1248,18 +1239,13 @@ def _build_translation_payload(extracted_data: Any, raw_ocr: Any) -> dict[str, A
     }
 
 
-# ── OCR subprocess with timeout + circuit breaker ──────────────────────────
-def _ocr_subprocess(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        cwd=str(POC_DIR),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        timeout=SETTINGS.ocr_subprocess_timeout_seconds,
-    )
+# ── OCR (in-process, preloaded engine) with circuit breaker ─────────────────
+# OCR runs in-process and reuses a preloaded singleton RapidOCR engine. The old
+# subprocess existed only to isolate PaddlePaddle crashes; RapidOCR is
+# onnxruntime-only (already stable in this process), so spawning a fresh Python
+# and reloading the det/cls/rec models (~4s) on every request was pure overhead.
+def _ocr_invoke(argv: list[str]) -> None:
+    ocr_worker.main(argv)
 
 
 def _run_ocr_script(
@@ -1269,11 +1255,8 @@ def _run_ocr_script(
     extract_mulkya: bool,
     is_pdf: bool,
     prefer_pdf_text: bool,
-) -> subprocess.CompletedProcess[str]:
-    python_executable = OCR_PYTHON if OCR_PYTHON.exists() else Path(sys.executable)
-    args = [
-        str(python_executable),
-        str(OCR_SCRIPT),
+) -> None:
+    argv = [
         str(input_path),
         "--write_text",
         "--no_images",
@@ -1281,57 +1264,32 @@ def _run_ocr_script(
         lang,
     ]
     if extract_mulkya:
-        args.append("--extract_mulkya")
+        argv.append("--extract_mulkya")
     if is_pdf and prefer_pdf_text:
-        args.append("--prefer_pdf_text")
+        argv.append("--prefer_pdf_text")
 
     pipeline_start = time.perf_counter()
     try:
-        completed = OCR_CB.call(_ocr_subprocess, args)
-    except subprocess.TimeoutExpired as exc:
+        OCR_CB.call(_ocr_invoke, argv)
+    except Exception as exc:  # noqa: BLE001 - normalise any OCR failure to the envelope
         record_pipeline_latency("ocr", time.perf_counter() - pipeline_start)
         log.error(
-            "ocr subprocess timed out",
-            extra={
-                "event": "ocr.timeout",
-                "timeout_seconds": SETTINGS.ocr_subprocess_timeout_seconds,
-            },
+            "ocr failed",
+            extra={"event": "ocr.failed", "exception": repr(exc)},
         )
-        raise DependencyTimeoutError(
-            f"OCR did not finish within {SETTINGS.ocr_subprocess_timeout_seconds:.0f}s.",
-            details={"stage": "ocr"},
-        ) from exc
-    except FileNotFoundError as exc:
-        raise ModelUnavailableError(
-            "OCR helper Python is not available on this pod.",
-            details={"hint": "Set UPSURE_OCR_PYTHON to a path inside the container."},
+        raise PipelineFailureError(
+            "OCR pipeline failed.",
+            details={"error": repr(exc)},
         ) from exc
 
     record_pipeline_latency("ocr", time.perf_counter() - pipeline_start)
 
-    if completed.returncode != 0:
-        log.error(
-            "ocr subprocess failed",
-            extra={
-                "event": "ocr.failed",
-                "returncode": completed.returncode,
-                "stderr_tail": (completed.stderr or "")[-500:],
-            },
-        )
-        raise PipelineFailureError(
-            "OCR pipeline failed.",
-            details={"returncode": completed.returncode},
-        )
-    return completed
-
 
 def _run_make_crop(image_path: Path) -> bool:
-    """Ask the OCR worker to deskew/crop the Mulkiya card to <stem>_cropped.jpg.
+    """Deskew/crop the Mulkiya card to <stem>_cropped.jpg via the OCR worker.
     Returns True if the crop file was produced. Best-effort; never raises."""
-    python_executable = OCR_PYTHON if OCR_PYTHON.exists() else Path(sys.executable)
-    args = [str(python_executable), str(OCR_SCRIPT), str(image_path), "--make_crop"]
     try:
-        OCR_CB.call(_ocr_subprocess, args)
+        OCR_CB.call(_ocr_invoke, [str(image_path), "--make_crop"])
     except Exception as exc:  # noqa: BLE001 - fallback path must not break the request
         log.warning("make_crop failed", extra={"event": "ocr.make_crop_failed", "exception": repr(exc)})
         return False
@@ -1574,6 +1532,7 @@ async def lifespan(app: FastAPI):
             ("yolo_damage", _get_yolo_session),
             ("card_noncard", _get_card_model),
             ("car_classifier", _get_car_model),
+            ("ocr_engine", ocr_worker.preload),
         ):
             try:
                 await run_in_threadpool(loader)
