@@ -66,3 +66,14 @@ Thumbs.db
 
 #API keys
 .env.secret
+
+#test folders
+car_test
+
+# ANPR plate-detection sidecar — separate git repo, own .venv + 256MB model
+plate-recognizer/
+
+# training / eval tooling (not part of the request path)
+scripts/
+train_binary_classifier.py
+api_eval.py
