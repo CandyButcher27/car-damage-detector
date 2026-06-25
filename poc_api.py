@@ -193,8 +193,10 @@ def _env_float_top(name: str, default: float) -> float:
 # Binary damage head threshold. Root cause of 1.1.1 false positives was inverted
 # class indices (model: 0=damaged, 1=clean; code assumed opposite). Reverted to
 # 0.25 now that _damage_result_from_probs uses the correct index.
-DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.45)
+DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.25)
 DAMAGE_IMG_SIZE = 260
+DAMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+DAMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 # Default raised from 0.35 → 0.65 after a false-positive at conf 0.636 on
 # Non_card_image_1.jpeg. Tunable per-deployment without redeploy via
@@ -260,19 +262,9 @@ YOLO_IOU = _env_float_top("UPSURE_YOLO_IOU", 0.45)
 # below so `_PARTS_RULES` / `_REPAIR_RULES` and the API `type` field stay stable.
 #   v3 index: 0 dent  1 scratch  2 crack  3 shattered_glass  4 broken_lamp  5 flat_tire
 YOLO_CLASSES = ["deformation", "scratches", "car-part-crack", "glass-crack", "lamp-crack", "flat-tire"]
+SEVERITY_MINOR_MAX = 0.05
+SEVERITY_MODERATE_MAX = 0.15
 _CAR_BBOX = [0.5, 0.5, 1.0, 1.0]
-
-# Class-based severity — zoom-invariant. bbox area proved unreliable because
-# a zoomed-in photo turns a minor scratch into "severe" by area fraction.
-_CLASS_SEVERITY: dict[str, str] = {
-    "flat-tire":      "severe",
-    "glass-crack":    "severe",
-    "deformation":    "moderate",
-    "lamp-crack":     "moderate",
-    "car-part-crack": "moderate",
-    "scratches":      "minor",
-    "general-damage": "minor",
-}
 
 # Policy decision: which damage class+severity combinations block (DENY) a
 # policy from being issued. A damage denies if its severity rank meets or
@@ -346,13 +338,25 @@ _PARTS_RULES: dict[tuple[str, str], list[str]] = {
     ("scratches", "center"):            ["door_panel"],
 }
 
-_REPAIR_RULES: dict[str, dict] = {
-    "car-part-crack": {"action": "Replace cracked part",                        "replace": True},
-    "deformation":    {"action": "Repair — PDR + repaint panel",                "replace": False},
-    "flat-tire":      {"action": "Replace tire + inspect rim and suspension",   "replace": True},
-    "glass-crack":    {"action": "Replace glass + inspect frame seals",         "replace": True},
-    "lamp-crack":     {"action": "Replace full lamp assembly",                  "replace": True},
-    "scratches":      {"action": "Repair — machine polish + touch-up paint",    "replace": False},
+_REPAIR_RULES: dict[tuple[str, str], dict] = {
+    ("car-part-crack", "minor"):    {"action": "Repair — filler + repaint",                      "replace": False},
+    ("car-part-crack", "moderate"): {"action": "Replace cracked part",                           "replace": True},
+    ("car-part-crack", "severe"):   {"action": "Replace part + inspect structural frame",        "replace": True},
+    ("deformation",    "minor"):    {"action": "Repair — paintless dent repair (PDR)",           "replace": False},
+    ("deformation",    "moderate"): {"action": "Repair — PDR + repaint panel",                   "replace": False},
+    ("deformation",    "severe"):   {"action": "Replace panel + inspect frame rails",            "replace": True},
+    ("flat-tire",      "minor"):    {"action": "Repair — patch tire",                            "replace": False},
+    ("flat-tire",      "moderate"): {"action": "Replace tire",                                   "replace": True},
+    ("flat-tire",      "severe"):   {"action": "Replace tire + inspect rim and suspension",      "replace": True},
+    ("glass-crack",    "minor"):    {"action": "Repair — resin injection (if single crack)",     "replace": False},
+    ("glass-crack",    "moderate"): {"action": "Replace glass panel",                            "replace": True},
+    ("glass-crack",    "severe"):   {"action": "Replace glass + inspect frame seals",            "replace": True},
+    ("lamp-crack",     "minor"):    {"action": "Replace lamp lens",                              "replace": True},
+    ("lamp-crack",     "moderate"): {"action": "Replace full lamp assembly",                     "replace": True},
+    ("lamp-crack",     "severe"):   {"action": "Replace lamp assembly + inspect mount",          "replace": True},
+    ("scratches",      "minor"):    {"action": "Repair — machine polish + touch-up paint",       "replace": False},
+    ("scratches",      "moderate"): {"action": "Repair — repaint panel",                         "replace": False},
+    ("scratches",      "severe"):   {"action": "Repair — filler + full panel repaint",           "replace": False},
 }
 
 
@@ -614,7 +618,8 @@ def _preprocess_for_damage(img_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = img.resize((DAMAGE_IMG_SIZE, DAMAGE_IMG_SIZE), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 255.0
-    return arr[np.newaxis]  # NHWC (1, 260, 260, 3) — matches training preprocessing
+    arr = (arr - DAMAGE_MEAN) / DAMAGE_STD
+    return arr.transpose(2, 0, 1)[np.newaxis]
 
 
 def _softmax_rows(logits: np.ndarray) -> np.ndarray:
@@ -694,8 +699,13 @@ def _nms(boxes: np.ndarray, scores: np.ndarray) -> list[int]:
     return keep
 
 
-def _get_severity(cls_name: str) -> str:
-    return _CLASS_SEVERITY.get(cls_name, "minor")
+def _get_severity(damage_w: float, damage_h: float) -> str:
+    ratio = damage_w * damage_h
+    if ratio < SEVERITY_MINOR_MAX:
+        return "minor"
+    if ratio < SEVERITY_MODERATE_MAX:
+        return "moderate"
+    return "severe"
 
 
 def _get_region(bbox: list[float]) -> str:
@@ -798,11 +808,11 @@ def _run_yolo_pipeline(img_bytes: bytes, view: str | None = None) -> list[dict[s
         bbox_px = boxes[i].tolist()
         bbox = [float(round(v / YOLO_SIZE, 4)) for v in bbox_px]
         cls_name = YOLO_CLASSES[int(class_ids[i])]
-        severity = _get_severity(cls_name)
+        severity = _get_severity(bbox[2], bbox[3])
         region = _get_region(bbox)
         parts = _remap_parts_for_view(view, _PARTS_RULES.get((cls_name, region), []))
         repair = _REPAIR_RULES.get(
-            cls_name,
+            (cls_name, severity),
             {"action": "Manual inspection required", "replace": False},
         )
         results.append({
@@ -2338,6 +2348,12 @@ def _policy_decision(per_view: dict[str, Any], damage_detected: bool) -> dict[st
     GRANT_WITH_WARNING  — damage present but none deny-worthy (amber alert).
     GRANT               — no damage.
     """
+    # All submitted views errored out → detection never ran. Do NOT fall through
+    # to GRANT (a hard error must not read as "clean car"). Signal ERROR so the
+    # caller blocks / asks for a recapture instead of issuing a policy.
+    if per_view and all(vres.get("error") for vres in per_view.values()):
+        return {"decision": "ERROR", "deny_reasons": []}
+
     deny_reasons: list[dict[str, Any]] = []
     for view_name, vres in per_view.items():
         for dmg in vres.get("damages", []) or []:
