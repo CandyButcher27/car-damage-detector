@@ -904,11 +904,10 @@ def _extract_mulkya_rulebased(lines: list[str]) -> dict:
             raw = pat.group(1)
             # Extract the 5-digit portion and the Arabic letter
             m2 = re.search(r"([\u0660-\u0669\u06F0-\u06F90-9]{5})", raw)
-            m3 = re.search(r"([\u0600-\u06FF])", raw)
-            if m2 and m3:
-                digits = _convert_arabic_indic_digits_to_ascii(m2.group(1))
-                arabic_letter = m3.group(1)
-                plate_number = f"{digits}{arabic_letter}"
+            if m2:
+                # Plate number is digits-only (T3). The Arabic emirate letter is
+                # intentionally dropped — it is not part of the numeric plate.
+                plate_number = _convert_arabic_indic_digits_to_ascii(m2.group(1))
     except Exception:
         pass
 
@@ -2541,7 +2540,11 @@ def main(argv=None) -> None:
         # clean upright cards, so only pay the template when that read is missing
         # or has an out-of-range field (rotated / multi-doc / noisy frames). When
         # it runs it OVERRIDES the range values (template > range > flat).
-        if _TEMPLATE_EXTRACTOR_ENABLED and not is_arabic and not _numeric_fields_complete(data):
+        # NOTE: the template extractor runs regardless of OCR language. It reads
+        # numeric cells (plate/VIN/cc/weights — language-agnostic digits), so
+        # Arabic mode must NOT disable it: Arabic is used only to read the card's
+        # labels/anchors, while numerics stay on this authoritative path.
+        if _TEMPLATE_EXTRACTOR_ENABLED and not _numeric_fields_complete(data):
             try:
                 import card_crop
                 crop, crop_reason = card_crop.choose_mulkiya_crop(image_bgr)
@@ -2576,6 +2579,15 @@ def main(argv=None) -> None:
                 data.setdefault("validation_notes", [])
                 if isinstance(data["validation_notes"], list):
                     data["validation_notes"].append(f"template_extractor_failed: {exc}")
+
+        # Plate number on UAE/Oman mulkiya is numeric-only. Strip any stray OCR
+        # symbols ('/', '.') or the Arabic emirate letter so the field carries
+        # digits only — never letters or punctuation. (T3)
+        if data.get("plate_number"):
+            _plate_digits = re.sub(
+                r"\D", "", _convert_arabic_indic_digits_to_ascii(str(data["plate_number"]))
+            )
+            data["plate_number"] = _plate_digits or None
 
         # Validate extracted data and add any inconsistency notes.
         _validate_and_note_data(data)
