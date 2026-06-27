@@ -247,41 +247,26 @@ def _resolve_damage_model_path() -> Path:
 DAMAGE_MODEL_PATH = _resolve_damage_model_path()
 
 YOLO_SIZE = 640
-# YOLO detection confidence floor. The v3 detector (YOLO11m, CarDD) scores
-# well below v2 — real-damage boxes routinely land in the 0.25-0.45 band, so a
-# 0.50 floor surfaces NO boxes on most damaged views and everything collapses
-# to the `general-damage` fallback. Default is 0.25 to match the v3 score
-# distribution (the operational value already shipped in .env); raise via env
-# only if a labelled sweep shows false positives. (Was briefly 0.50 in 1.1.1
-# for the v2 detector.) Tunable via env.
-YOLO_CONF = _env_float_top("UPSURE_YOLO_CONF", 0.25)
+# YOLO detection confidence floor. v4 (YOLO11m, CarDD-7) scores land in
+# the 0.25-0.45 band on real WhatsApp insurance photos after car-crop.
+# Default 0.30 requires clearer evidence than the old 0.25 floor, matching
+# the stricter "YOLO must confirm" policy: if no box passes this threshold
+# the view is reported CLEAN regardless of binary output.
+YOLO_CONF = _env_float_top("UPSURE_YOLO_CONF", 0.30)
 # NMS IoU — kept compile-time; rarely tuned per deployment.
 YOLO_IOU = _env_float_top("UPSURE_YOLO_IOU", 0.45)
-# damage_detector_v3 (YOLO11m, CarDD) emits classes in a different order/name
-# scheme than v2. We map each v3 class index onto the canonical rule-table key
-# below so `_PARTS_RULES` / `_REPAIR_RULES` and the API `type` field stay stable.
-#   v3 index: 0 dent  1 scratch  2 crack  3 shattered_glass  4 broken_lamp  5 flat_tire
-YOLO_CLASSES = ["deformation", "scratches", "car-part-crack", "glass-crack", "lamp-crack", "flat-tire"]
-SEVERITY_MINOR_MAX = 0.05
-SEVERITY_MODERATE_MAX = 0.15
-_CAR_BBOX = [0.5, 0.5, 1.0, 1.0]
+# damage_detector_v4 (YOLO11m, CarDD-7) class index → canonical rule-table key.
+#   v4 index: 0=deformation  1=dent  2=scratches  3=car-part-crack
+#             4=glass-crack  5=lamp-crack  6=flat-tire
+# Indices 0 and 1 both map to "deformation" (panel deformation + dent treated identically).
+YOLO_CLASSES = ["deformation", "deformation", "scratches", "car-part-crack", "glass-crack", "lamp-crack", "flat-tire"]
 
-# Policy decision: which damage class+severity combinations block (DENY) a
-# policy from being issued. A damage denies if its severity rank meets or
-# exceeds the class threshold below. Classes not listed (and IGNORE classes)
-# never deny. `general-damage` (binary positive, YOLO could not localise) is
-# handled specially — it denies only at `severe`, so an unlocalised severe hit
-# is not silently granted.
-SEVERITY_RANK = {"minor": 0, "moderate": 1, "severe": 2}
-POLICY_DENY_RULES = {
-    "scratches": "severe",
-    "car-part-crack": "severe",
-    "deformation": "moderate",
-    "glass-crack": "moderate",
-    "lamp-crack": "moderate",
-}
-POLICY_IGNORE_CLASSES = {"flat-tire","general-damage"}
-GENERAL_DAMAGE_DENY_SEVERITY = "severe"
+# COCO car-crop detector: YOLO11n exported from ultralytics, 80-class COCO.
+# Used to isolate the car region before binary + YOLO damage inference.
+# COCO class indices for vehicles: 2=car, 7=truck.
+COCO_CAR_CLASSES = {2, 7}
+CAR_CROP_CONF = 0.25
+CAR_CROP_PADDING = 0.10
 
 
 def _resolve_yolo_model_path() -> Path:
@@ -289,10 +274,12 @@ def _resolve_yolo_model_path() -> Path:
     if env_path:
         return Path(env_path)
     candidates = [
-        POC_DIR / "models" / "damage_detector_v3.onnx",
+        POC_DIR / "models" / "digiLifeDoc_damage_detector_v4.onnx",
+        POC_DIR / "models" / "damage_detector_v4.onnx",
         POC_DIR / "models" / "digiLifeDoc_damage_detector_v3.onnx",
-        POC_DIR / "models" / "damage_detector_v2.onnx",
+        POC_DIR / "models" / "damage_detector_v3.onnx",
         POC_DIR / "models" / "digiLifeDoc_damage_detector_v2.onnx",
+        POC_DIR / "models" / "damage_detector_v2.onnx",
         POC_DIR / "models" / "damage_detector.onnx",
     ]
     for c in candidates:
@@ -302,6 +289,23 @@ def _resolve_yolo_model_path() -> Path:
 
 
 YOLO_MODEL_PATH = _resolve_yolo_model_path()
+
+
+def _resolve_car_crop_model_path() -> Path:
+    env_path = os.getenv("UPSURE_CAR_CROP_MODEL")
+    if env_path:
+        return Path(env_path)
+    candidates = [
+        POC_DIR / "models" / "digiLifeDoc_coco_car_crop.onnx",
+        POC_DIR / "models" / "coco_car_crop.onnx",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
+CAR_CROP_MODEL_PATH = _resolve_car_crop_model_path()
 
 
 # Rule tables (unchanged business logic)
@@ -338,25 +342,15 @@ _PARTS_RULES: dict[tuple[str, str], list[str]] = {
     ("scratches", "center"):            ["door_panel"],
 }
 
-_REPAIR_RULES: dict[tuple[str, str], dict] = {
-    ("car-part-crack", "minor"):    {"action": "Repair — filler + repaint",                      "replace": False},
-    ("car-part-crack", "moderate"): {"action": "Replace cracked part",                           "replace": True},
-    ("car-part-crack", "severe"):   {"action": "Replace part + inspect structural frame",        "replace": True},
-    ("deformation",    "minor"):    {"action": "Repair — paintless dent repair (PDR)",           "replace": False},
-    ("deformation",    "moderate"): {"action": "Repair — PDR + repaint panel",                   "replace": False},
-    ("deformation",    "severe"):   {"action": "Replace panel + inspect frame rails",            "replace": True},
-    ("flat-tire",      "minor"):    {"action": "Repair — patch tire",                            "replace": False},
-    ("flat-tire",      "moderate"): {"action": "Replace tire",                                   "replace": True},
-    ("flat-tire",      "severe"):   {"action": "Replace tire + inspect rim and suspension",      "replace": True},
-    ("glass-crack",    "minor"):    {"action": "Repair — resin injection (if single crack)",     "replace": False},
-    ("glass-crack",    "moderate"): {"action": "Replace glass panel",                            "replace": True},
-    ("glass-crack",    "severe"):   {"action": "Replace glass + inspect frame seals",            "replace": True},
-    ("lamp-crack",     "minor"):    {"action": "Replace lamp lens",                              "replace": True},
-    ("lamp-crack",     "moderate"): {"action": "Replace full lamp assembly",                     "replace": True},
-    ("lamp-crack",     "severe"):   {"action": "Replace lamp assembly + inspect mount",          "replace": True},
-    ("scratches",      "minor"):    {"action": "Repair — machine polish + touch-up paint",       "replace": False},
-    ("scratches",      "moderate"): {"action": "Repair — repaint panel",                         "replace": False},
-    ("scratches",      "severe"):   {"action": "Repair — filler + full panel repaint",           "replace": False},
+# Flat repair recommendations per damage class — no severity tier.
+# Placeholder until Tameen confirms their policy rules.
+_REPAIR_RULES: dict[str, dict] = {
+    "car-part-crack": {"action": "Inspect cracked part; replace if structurally compromised",   "replace": True},
+    "deformation":    {"action": "Inspect panel; repair with PDR or replace if deformed",       "replace": False},
+    "flat-tire":      {"action": "Replace tire; inspect rim and suspension",                     "replace": True},
+    "glass-crack":    {"action": "Replace glass panel immediately",                              "replace": True},
+    "lamp-crack":     {"action": "Replace lamp assembly",                                        "replace": True},
+    "scratches":      {"action": "Polish and repaint affected panel",                            "replace": False},
 }
 
 
@@ -407,6 +401,7 @@ _car_model: Any | None = None
 _car_img_size = CAR_FALLBACK_SIZE
 _damage_session: ort.InferenceSession | None = None
 _yolo_session: ort.InferenceSession | None = None
+_car_crop_session: ort.InferenceSession | None = None
 _mulkiya_classifier: BinaryOnnxImageClassifier | None = None
 
 
@@ -519,6 +514,13 @@ def _load_yolo_session() -> ort.InferenceSession:
     return ort.InferenceSession(str(YOLO_MODEL_PATH), providers=["CPUExecutionProvider"])
 
 
+@retry(attempts=3, base_delay=0.5, max_delay=4.0)
+def _load_car_crop_session() -> ort.InferenceSession:
+    if not CAR_CROP_MODEL_PATH.exists():
+        raise FileNotFoundError(f"Car crop model not found at {CAR_CROP_MODEL_PATH}")
+    return ort.InferenceSession(str(CAR_CROP_MODEL_PATH), providers=["CPUExecutionProvider"])
+
+
 def _get_card_model() -> CardNonCardModel:
     global _card_model
     if _card_model is None:
@@ -560,6 +562,14 @@ def _get_yolo_session() -> ort.InferenceSession:
         _yolo_session = _load_yolo_session()
         set_model_readiness("yolo_damage", True)
     return _yolo_session
+
+
+def _get_car_crop_session() -> ort.InferenceSession:
+    global _car_crop_session
+    if _car_crop_session is None:
+        _car_crop_session = _load_car_crop_session()
+        set_model_readiness("car_crop", True)
+    return _car_crop_session
 
 
 def _get_mulkiya_classifier() -> BinaryOnnxImageClassifier | None:
@@ -614,6 +624,88 @@ def _mulkiya_front_gate(
 
 
 # ── Preprocessing / inference helpers ──────────────────────────────────────
+def _crop_to_car_bytes(
+    img_bytes: bytes,
+) -> tuple[bytes, tuple[int, int, int, int, int, int] | None]:
+    """Detect the largest car/truck in the image and return a cropped version.
+
+    Returns (cropped_bytes, (x1, y1, x2, y2, orig_w, orig_h)) on success, or
+    (original_bytes, None) when no vehicle is found (damage models see full image).
+    Cropped bytes are PNG (lossless) to avoid a second compression round-trip.
+    """
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    orig_w, orig_h = img.size
+
+    try:
+        sess = _get_car_crop_session()
+    except Exception as exc:
+        log.warning("car crop session unavailable; using full image",
+                    extra={"event": "car_crop.session_failed", "exception": repr(exc)})
+        return img_bytes, None
+
+    resized = img.resize((640, 640), Image.LANCZOS)
+    arr = np.array(resized, dtype=np.float32) / 255.0
+    arr = arr.transpose(2, 0, 1)[np.newaxis]
+
+    try:
+        output = sess.run(None, {sess.get_inputs()[0].name: arr})[0]
+    except Exception as exc:
+        log.warning("car crop inference failed; using full image",
+                    extra={"event": "car_crop.infer_failed", "exception": repr(exc)})
+        return img_bytes, None
+
+    preds = output[0].T                   # (8400, 84)
+    boxes = preds[:, :4]                  # cx, cy, w, h in [0,640] pixel space
+    class_scores = preds[:, 4:]           # (8400, 80) — COCO classes
+
+    car_scores = class_scores[:, [2, 7]].max(axis=1)
+    mask = car_scores >= CAR_CROP_CONF
+    if not mask.any():
+        return img_bytes, None
+
+    best = int(np.argmax(np.where(mask, car_scores, 0.0)))
+    cx, cy, bw, bh = boxes[best]
+    x1 = (cx - bw / 2) / 640 * orig_w
+    y1 = (cy - bh / 2) / 640 * orig_h
+    x2 = (cx + bw / 2) / 640 * orig_w
+    y2 = (cy + bh / 2) / 640 * orig_h
+
+    pad_x = (x2 - x1) * CAR_CROP_PADDING
+    pad_y = (y2 - y1) * CAR_CROP_PADDING
+    x1 = max(0, int(x1 - pad_x))
+    y1 = max(0, int(y1 - pad_y))
+    x2 = min(orig_w, int(x2 + pad_x))
+    y2 = min(orig_h, int(y2 + pad_y))
+
+    if x2 <= x1 or y2 <= y1:
+        return img_bytes, None
+
+    crop = img.crop((x1, y1, x2, y2))
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    return buf.getvalue(), (x1, y1, x2, y2, orig_w, orig_h)
+
+
+def _remap_bbox(
+    bbox: list[float],
+    crop_info: tuple[int, int, int, int, int, int],
+) -> list[float]:
+    """Map a bbox from crop-fraction space back to original-image-fraction space.
+
+    bbox = [cx, cy, w, h] as fractions of the YOLO 640x640 crop input.
+    crop_info = (x1, y1, x2, y2, orig_w, orig_h) from _crop_to_car_bytes.
+    """
+    x1, y1, x2, y2, orig_w, orig_h = crop_info
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    bcx, bcy, bw, bh = bbox
+    px_cx = bcx * crop_w + x1
+    px_cy = bcy * crop_h + y1
+    px_w  = bw  * crop_w
+    px_h  = bh  * crop_h
+    return [px_cx / orig_w, px_cy / orig_h, px_w / orig_w, px_h / orig_h]
+
+
 def _preprocess_for_damage(img_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = img.resize((DAMAGE_IMG_SIZE, DAMAGE_IMG_SIZE), Image.LANCZOS)
@@ -699,15 +791,6 @@ def _nms(boxes: np.ndarray, scores: np.ndarray) -> list[int]:
     return keep
 
 
-def _get_severity(damage_w: float, damage_h: float) -> str:
-    ratio = damage_w * damage_h
-    if ratio < SEVERITY_MINOR_MAX:
-        return "minor"
-    if ratio < SEVERITY_MODERATE_MAX:
-        return "moderate"
-    return "severe"
-
-
 def _get_region(bbox: list[float]) -> str:
     dx = bbox[0] - _CAR_BBOX[0]
     dy = bbox[1] - _CAR_BBOX[1]
@@ -784,7 +867,11 @@ def _remap_parts_for_view(view: str | None, parts: list[str]) -> list[str]:
     return [remap.get(p, p) for p in parts]
 
 
-def _run_yolo_pipeline(img_bytes: bytes, view: str | None = None) -> list[dict[str, Any]]:
+def _run_yolo_pipeline(
+    img_bytes: bytes,
+    view: str | None = None,
+    crop_info: tuple[int, int, int, int, int, int] | None = None,
+) -> list[dict[str, Any]]:
     arr = _preprocess_yolo(img_bytes)
     sess = _get_yolo_session()
     inp = sess.get_inputs()[0].name
@@ -807,18 +894,18 @@ def _run_yolo_pipeline(img_bytes: bytes, view: str | None = None) -> list[dict[s
     for i in keep:
         bbox_px = boxes[i].tolist()
         bbox = [float(round(v / YOLO_SIZE, 4)) for v in bbox_px]
+        if crop_info is not None:
+            bbox = _remap_bbox(bbox, crop_info)
         cls_name = YOLO_CLASSES[int(class_ids[i])]
-        severity = _get_severity(bbox[2], bbox[3])
         region = _get_region(bbox)
         parts = _remap_parts_for_view(view, _PARTS_RULES.get((cls_name, region), []))
         repair = _REPAIR_RULES.get(
-            (cls_name, severity),
+            cls_name,
             {"action": "Manual inspection required", "replace": False},
         )
         results.append({
             "type":          cls_name,
             "confidence":    float(round(float(max_scores[i]), 4)),
-            "severity":      severity,
             "bbox":          bbox,
             "parts_at_risk": parts,
             "repair_action": repair["action"],
@@ -1527,6 +1614,7 @@ async def lifespan(app: FastAPI):
     init_metrics()
     set_model_readiness("damage_binary", False)
     set_model_readiness("yolo_damage", False)
+    set_model_readiness("car_crop", False)
     set_model_readiness("car_classifier", False)
     set_model_readiness("card_noncard", False)
     set_model_readiness("mulkiya_classifier", False)
@@ -1548,6 +1636,7 @@ async def lifespan(app: FastAPI):
         for label, loader in (
             ("damage_binary", _get_damage_session),
             ("yolo_damage", _get_yolo_session),
+            ("car_crop", _get_car_crop_session),
             ("card_noncard", _get_card_model),
             ("car_classifier", _get_car_model),
             ("ocr_engine", ocr_worker.preload),
@@ -1644,6 +1733,19 @@ def _check_yolo_model() -> ComponentStatus:
         return ComponentStatus("yolo_damage", False, critical=False, detail=str(exc), extra={"path": str(YOLO_MODEL_PATH)})
 
 
+def _check_car_crop_model() -> ComponentStatus:
+    global _car_crop_session
+    if _car_crop_session is not None:
+        return ComponentStatus("car_crop", True, critical=False, extra={"path": str(CAR_CROP_MODEL_PATH)})
+    try:
+        _car_crop_session = _load_car_crop_session.__wrapped__()
+        set_model_readiness("car_crop", True)
+        return ComponentStatus("car_crop", True, critical=False, extra={"path": str(CAR_CROP_MODEL_PATH)})
+    except Exception as exc:
+        set_model_readiness("car_crop", False)
+        return ComponentStatus("car_crop", False, critical=False, detail=str(exc), extra={"path": str(CAR_CROP_MODEL_PATH)})
+
+
 def _check_car_model() -> ComponentStatus:
     global _car_model, _car_img_size
     if _car_model is not None:
@@ -1716,6 +1818,7 @@ def _check_circuits() -> ComponentStatus:
 
 health_registry.register("damage_binary", _check_damage_model)
 health_registry.register("yolo_damage", _check_yolo_model)
+health_registry.register("car_crop", _check_car_crop_model)
 health_registry.register("car_classifier", _check_car_model)
 health_registry.register("card_noncard", _check_card_model)
 health_registry.register("plate_sidecar", _check_plate_service)
@@ -2205,8 +2308,9 @@ def _damage_for_view(
     isn't available. For multi-view requests, the endpoint uses
     ``_run_damage_inference_batch`` directly.
     """
-    pred = DAMAGE_CB.call(lambda: _run_damage_inference(_preprocess_for_damage(img_bytes)))
-    return _finish_damage_view(pred, img_bytes, yolo_available, view=view)
+    cropped_bytes, crop_info = _crop_to_car_bytes(img_bytes)
+    pred = DAMAGE_CB.call(lambda: _run_damage_inference(_preprocess_for_damage(cropped_bytes)))
+    return _finish_damage_view(pred, cropped_bytes, yolo_available, view=view, crop_info=crop_info)
 
 
 def _finish_damage_view(
@@ -2214,34 +2318,34 @@ def _finish_damage_view(
     img_bytes: bytes,
     yolo_available: bool,
     view: str | None = None,
+    crop_info: tuple[int, int, int, int, int, int] | None = None,
 ) -> dict[str, Any]:
-    """Run YOLO and the general-damage fallback once a binary prediction is in."""
+    """Run YOLO confirmation once a binary prediction is in.
+
+    Policy: damage_detected is True ONLY when YOLO localises at least one box
+    above YOLO_CONF. If binary says damaged but YOLO finds nothing, the view is
+    reported CLEAN. This trades recall for precision — minor/ambiguous damage that
+    YOLO cannot pin is passed as clean.
+    """
     if pred["damage_detected"] and yolo_available:
         try:
-            pred["damages"] = YOLO_CB.call(_run_yolo_pipeline, img_bytes, view)
+            boxes = YOLO_CB.call(_run_yolo_pipeline, img_bytes, view, crop_info)
         except Exception as exc:
             log.warning(
-                "yolo failed for view; falling back",
+                "yolo failed for view; treating as clean",
                 extra={"event": "yolo.failed", "exception": repr(exc), "view": view},
             )
+            boxes = []
+
+        if boxes:
+            pred["damages"] = boxes
+        else:
+            # YOLO could not confirm — override binary decision to CLEAN.
+            pred["damage_detected"] = False
             pred["damages"] = []
     else:
         pred["damages"] = []
 
-    if pred["damage_detected"] and not pred["damages"]:
-        p = pred["prob_damaged"]
-        sev = "severe" if p >= 0.80 else "moderate" if p >= 0.65 else "minor"
-        pred["damages"] = [{
-            "type": "general-damage",
-            "severity": sev,
-            "confidence": round(p, 4),
-            "bbox": [0.5, 0.5, 1.0, 1.0],
-            "region": "unknown",
-            "parts_at_risk": ["undetermined"],
-            "replace": False,
-            "repair_action": "Visual inspection required — damage detected but type could not be localized automatically",
-            "view": view,
-        }]
     return pred
 
 
@@ -2260,14 +2364,21 @@ def _damage_batch_for_views(
     if not names:
         return {}
 
+    # Stage 0: crop each view to the car region before all inference.
+    crop_results = {name: _crop_to_car_bytes(view_img_bytes[name]) for name in names}
+    cropped = {name: crop_results[name][0] for name in names}
+    crop_infos = {name: crop_results[name][1] for name in names}
+
     preprocessed = np.concatenate(
-        [_preprocess_for_damage(view_img_bytes[name]) for name in names], axis=0
+        [_preprocess_for_damage(cropped[name]) for name in names], axis=0
     )
     batch_preds = DAMAGE_CB.call(_run_damage_inference_batch, preprocessed)
 
     out: dict[str, dict[str, Any]] = {}
     for name, pred in zip(names, batch_preds):
-        out[name] = _finish_damage_view(pred, view_img_bytes[name], yolo_available, view=name)
+        out[name] = _finish_damage_view(
+            pred, cropped[name], yolo_available, view=name, crop_info=crop_infos[name]
+        )
     return out
 
 
@@ -2328,46 +2439,25 @@ async def _plate_for_views(
     return dict(zip(targets, results))
 
 
-def _damage_denies(cls: str, severity: str) -> bool:
-    """Does a single damage (class + severity) block policy issuance?"""
-    if cls in POLICY_IGNORE_CLASSES:
-        return False
-    sev_rank = SEVERITY_RANK.get(severity, 0)
-    if cls == "general-damage":
-        return sev_rank >= SEVERITY_RANK[GENERAL_DAMAGE_DENY_SEVERITY]
-    threshold = POLICY_DENY_RULES.get(cls)
-    if threshold is None:
-        return False
-    return sev_rank >= SEVERITY_RANK[threshold]
-
-
 def _policy_decision(per_view: dict[str, Any], damage_detected: bool) -> dict[str, Any]:
-    """Derive the policy verdict from per-view damages.
+    """Derive the policy verdict.
 
-    DENY                — at least one damage matches the deny matrix.
-    GRANT_WITH_WARNING  — damage present but none deny-worthy (amber alert).
-    GRANT               — no damage.
+    DENY  — YOLO-confirmed damage present in at least one view.
+    GRANT — no YOLO-confirmed damage.
+    ERROR — all views errored (detection never ran; do not silently grant).
+
+    Severity-based rules are a placeholder pending Tameen policy clarification.
+    For now any YOLO-confirmed damage denies the policy.
     """
-    # All submitted views errored out → detection never ran. Do NOT fall through
-    # to GRANT (a hard error must not read as "clean car"). Signal ERROR so the
-    # caller blocks / asks for a recapture instead of issuing a policy.
     if per_view and all(vres.get("error") for vres in per_view.values()):
         return {"decision": "ERROR", "deny_reasons": []}
 
     deny_reasons: list[dict[str, Any]] = []
     for view_name, vres in per_view.items():
         for dmg in vres.get("damages", []) or []:
-            cls = dmg.get("type")
-            severity = dmg.get("severity", "minor")
-            if _damage_denies(cls, severity):
-                deny_reasons.append({"view": view_name, "class": cls, "severity": severity})
+            deny_reasons.append({"view": view_name, "class": dmg.get("type"), "confidence": dmg.get("confidence")})
 
-    if deny_reasons:
-        decision = "DENY"
-    elif damage_detected:
-        decision = "GRANT_WITH_WARNING"
-    else:
-        decision = "GRANT"
+    decision = "DENY" if deny_reasons else "GRANT"
     return {"decision": decision, "deny_reasons": deny_reasons}
 
 
