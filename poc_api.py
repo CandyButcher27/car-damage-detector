@@ -30,6 +30,7 @@ import mimetypes
 import os
 import tempfile
 import time
+import urllib.request
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
@@ -267,6 +268,39 @@ YOLO_CLASSES = ["deformation", "deformation", "scratches", "car-part-crack", "gl
 COCO_CAR_CLASSES = {2, 7}
 CAR_CROP_CONF = 0.25
 CAR_CROP_PADDING = 0.10
+
+
+def _download_model_from_gcs(dest: Path, url: str) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".tmp")
+    log.info(
+        "downloading model from GCS",
+        extra={"event": "model.gcs_download.start", "url": url, "dest": str(dest)},
+    )
+    try:
+        urllib.request.urlretrieve(url, str(tmp))
+        tmp.rename(dest)
+        size_mb = dest.stat().st_size / 1_048_576
+        log.info(
+            "model downloaded from GCS",
+            extra={"event": "model.gcs_download.done", "dest": str(dest), "size_mb": round(size_mb, 1)},
+        )
+    except Exception as exc:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"GCS download failed for {url}: {exc}") from exc
+
+
+def _ensure_model_from_gcs(dest: Path, gcs_url_env: str) -> None:
+    if dest.exists():
+        return
+    url = os.getenv(gcs_url_env, "").strip()
+    if not url:
+        log.warning(
+            "model file missing and no GCS URL configured",
+            extra={"event": "model.gcs_missing", "path": str(dest), "env_var": gcs_url_env},
+        )
+        return
+    _download_model_from_gcs(dest, url)
 
 
 def _resolve_yolo_model_path() -> Path:
@@ -1629,6 +1663,12 @@ async def lifespan(app: FastAPI):
             "preload_models": SETTINGS.preload_models_on_startup,
         },
     )
+
+    # Download damage models from GCS if not present locally.
+    # Set UPSURE_YOLO_GCS_URL / UPSURE_CAR_CROP_GCS_URL in the deployment env
+    # pointing to the public (or signed) GCS object URLs.
+    await run_in_threadpool(_ensure_model_from_gcs, YOLO_MODEL_PATH, "UPSURE_YOLO_GCS_URL")
+    await run_in_threadpool(_ensure_model_from_gcs, CAR_CROP_MODEL_PATH, "UPSURE_CAR_CROP_GCS_URL")
 
     if SETTINGS.preload_models_on_startup:
         # Best-effort preload: log failures but don't block startup. /readyz
