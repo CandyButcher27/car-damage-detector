@@ -191,10 +191,10 @@ def _env_float_top(name: str, default: float) -> float:
         return default
 
 
-# Binary damage head threshold. Root cause of 1.1.1 false positives was inverted
-# class indices (model: 0=damaged, 1=clean; code assumed opposite). Reverted to
-# 0.25 now that _damage_result_from_probs uses the correct index.
-DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.25)
+# Binary damage threshold raised to 0.70 — binary classifier was trained on
+# VLM-generated labels which over-flag minor marks. Only high-confidence binary
+# detections proceed to YOLO. YOLO at 0.30 is the real confirmation gate.
+DAMAGE_THRESHOLD = _env_float_top("UPSURE_DAMAGE_THRESHOLD", 0.70)
 DAMAGE_IMG_SIZE = 260
 DAMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DAMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -677,8 +677,17 @@ def _crop_to_car_bytes(
                     extra={"event": "car_crop.session_failed", "exception": repr(exc)})
         return img_bytes, None
 
-    resized = img.resize((640, 640), Image.LANCZOS)
-    arr = np.array(resized, dtype=np.float32) / 255.0
+    # Letterbox resize (preserve aspect ratio, pad with gray) — matches ultralytics
+    # preprocessing so ONNX box coords map correctly back to original pixel space.
+    lbox_size = 640
+    scale = min(lbox_size / orig_w, lbox_size / orig_h)
+    new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    letterboxed = Image.new("RGB", (lbox_size, lbox_size), (114, 114, 114))
+    pad_x = (lbox_size - new_w) / 2
+    pad_y = (lbox_size - new_h) / 2
+    letterboxed.paste(resized, (int(pad_x), int(pad_y)))
+    arr = np.array(letterboxed, dtype=np.float32) / 255.0
     arr = arr.transpose(2, 0, 1)[np.newaxis]
 
     try:
@@ -689,7 +698,7 @@ def _crop_to_car_bytes(
         return img_bytes, None
 
     preds = output[0].T                   # (8400, 84)
-    boxes = preds[:, :4]                  # cx, cy, w, h in [0,640] pixel space
+    boxes = preds[:, :4]                  # cx, cy, w, h in letterbox pixel space
     class_scores = preds[:, 4:]           # (8400, 80) — COCO classes
 
     car_scores = class_scores[:, [2, 7]].max(axis=1)
@@ -699,10 +708,11 @@ def _crop_to_car_bytes(
 
     best = int(np.argmax(np.where(mask, car_scores, 0.0)))
     cx, cy, bw, bh = boxes[best]
-    x1 = (cx - bw / 2) / 640 * orig_w
-    y1 = (cy - bh / 2) / 640 * orig_h
-    x2 = (cx + bw / 2) / 640 * orig_w
-    y2 = (cy + bh / 2) / 640 * orig_h
+    # Unpad letterbox offset then unscale to original pixel space
+    x1 = (cx - bw / 2 - pad_x) / scale
+    y1 = (cy - bh / 2 - pad_y) / scale
+    x2 = (cx + bw / 2 - pad_x) / scale
+    y2 = (cy + bh / 2 - pad_y) / scale
 
     pad_x = (x2 - x1) * CAR_CROP_PADDING
     pad_y = (y2 - y1) * CAR_CROP_PADDING

@@ -33,16 +33,16 @@ data:
   UPSURE_PRELOAD_MODELS: "true"
   UPSURE_REQUIRE_MODELS_FOR_READY: "true"
   UPSURE_DAMAGE_MODEL: "/app/models/damage_model.onnx"
-  UPSURE_YOLO_MODEL: "/app/models/damage_detector_v3.onnx"
+  UPSURE_YOLO_MODEL: "/app/models/digiLifeDoc_damage_detector_v4.onnx"
+  UPSURE_CAR_CROP_MODEL: "/app/models/digiLifeDoc_coco_car_crop.onnx"
   UPSURE_CAR_MODEL: "/app/models/best_car_model_v2.onnx"
   UPSURE_CAR_THRESHOLD: "0.65"
   UPSURE_CAR_MODEL_POSITIVE_HIGH: "false"
-  # Bumped in 1.1.1 after FP burst on clean cars. Re-tune from observed
-  # precision/recall once we have a labelled production set.
-  UPSURE_DAMAGE_THRESHOLD: "0.50"
-  # Lowered 0.50 -> 0.25 for the v3 detector (YOLO11m); v3 scores far below v2,
-  # 0.50 surfaced no boxes. Re-tune from a labelled set via the threshold sweep.
-  UPSURE_YOLO_CONF: "0.25"
+  # Raised to 0.70 — binary classifier trained on VLM labels is over-sensitive.
+  # Only high-confidence binary detections proceed to YOLO confirmation gate.
+  UPSURE_DAMAGE_THRESHOLD: "0.70"
+  # YOLO confirmation gate. v4 (YOLO11m, CarDD-7) scores land in 0.15-0.45 range.
+  UPSURE_YOLO_CONF: "0.30"
 
   # --- Plate-recognizer sidecar (separate Deployment + Service) ---
   # Reached via the in-cluster Service DNS. Set to "false" to disable plate
